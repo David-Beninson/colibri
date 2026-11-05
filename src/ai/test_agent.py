@@ -1,14 +1,13 @@
-"""Self-contained unit test suite for the Colibri Desktop Holographic AI Companion (`src/ai/test_agent.py`).
+"""Self-contained unit test suite for the Colibri AI Companion (`src/ai/test_agent.py`).
 
 Verifies:
-1. Unified 6-domain tool registration (`internet`, `vision`, `audio`/`voice`, `rag`, `code_runner`, `device`)
+1. Unified companion tool registration (`internet`, `vision`, `audio`/`voice`, `rag`, `code_runner`)
 2. Bilingual Persona & deterministic system prompt (`persona.py`: `COMPANION_PERSONA_PROMPT`, `build_system_prompt`)
 3. Local RAG Memory persistence (`save_fact`, `query_memory`, `save_conversation_fact`, `query_local_knowledge` in `data/memory_db/`)
-4. Hardware & Pepper's Ghost 3D Avatar hooks (`rotate_device`, `rotate_device_servo`, `set_avatar_state`, `trigger_hologram_effect`)
-5. Safe AST math (`calculate`) & sandboxed Python code execution (`run_python_calculation`)
-6. Vision (`extract_text_from_image`, `detect_person_angle`) & Voice (`transcribe_audio`, `text_to_speech`, Hebrew/English voice routing)
-7. Strict SSRF blocking (`127.0.0.1`, `169.254.169.254`, `192.168.1.1`) & HTML readable extraction
-8. StateGraph transitions (`agent -> tools -> reflect_and_guard -> end`) with Qwen3.6 prefix flags & `SystemOneClient`
+4. Safe AST math (`calculate`) & sandboxed Python code execution (`run_python_calculation`)
+5. Vision (`extract_text_from_image`, `describe_image_scene`) & Voice (`transcribe_audio`, `text_to_speech`, Hebrew/English voice routing)
+6. Strict SSRF blocking (`127.0.0.1`, `169.254.169.254`, `192.168.1.1`) & HTML readable extraction
+7. StateGraph transitions (`agent -> tools -> reflect_and_guard -> end`) with Qwen3.6 prefix flags & `SystemOneClient`
 """
 from __future__ import annotations
 
@@ -24,42 +23,42 @@ from unittest.mock import patch
 from src.ai.config import AgentConfig, detect_colibri_model
 from src.ai.graph import (
     SYSTEM_PROMPT,
+    ColibriSqliteCheckpointer,
     StdlibColibriAgent,
     build_internet_agent_graph,
+    classify_user_intent,
     get_langchain_tools,
+    get_session_history,
     run_agent,
 )
 from src.ai.persona import (
-    BIRTHDAY_GREETING_EN,
-    BIRTHDAY_GREETING_HE,
+    COMPANION_NAME,
     COMPANION_PERSONA_PROMPT,
     build_system_prompt,
 )
 from src.ai.systemone import SystemOneClient
 from src.ai.tools import (
+    CANONICAL_COLLECTIONS,
     OPENAI_TOOLS_SCHEMA,
     TOOL_REGISTRY,
+    _resolve_collection,
     calculate,
-    detect_person_angle,
+    describe_image_scene,
     extract_text_from_image,
     fetch_json_or_rss,
     fetch_webpage,
-    get_device_state,
+    ingest_url_or_note,
     list_saved_facts,
     load_all_tool_suites,
     query_local_knowledge,
     query_memory,
-    rotate_device,
-    rotate_device_servo,
     run_python_calculation,
     save_conversation_fact,
     save_fact,
-    set_avatar_state,
+    scale_recipe,
     speak_text,
     text_to_speech,
     transcribe_audio,
-    trigger_avatar_state,
-    trigger_hologram_effect,
 )
 from src.ai.tools.audio import _select_voice
 from src.ai.tools.internet import _LinkAndTextExtractor, _public_url
@@ -137,9 +136,6 @@ class _MockColibriGateway:
                 },
                 url=url,
             )
-
-        if "/servo/rotate" in url or "/avatar/state" in url or "/hologram/effect" in url:
-            return _MockHTTPResponse({"status": "ok", "bridge": "mock_rpi"}, url=url)
 
         if url.endswith("/chat/completions"):
             messages = body.get("messages") or []
@@ -264,7 +260,7 @@ class ColibriAgentTestSuite(unittest.TestCase):
         self.gateway = _MockColibriGateway()
         self.base_url = "http://127.0.0.1:8000/v1"
 
-    def test_all_six_tool_suites_registered(self) -> None:
+    def test_companion_tool_suites_registered(self) -> None:
         registry, schemas, tools_list = load_all_tool_suites()
         expected_core_tools = {
             # Internet suite
@@ -282,7 +278,6 @@ class ColibriAgentTestSuite(unittest.TestCase):
             # Vision suite
             "extract_text_from_image",
             "describe_image_scene",
-            "detect_person_angle",
             # Voice / Audio suite
             "transcribe_audio",
             "text_to_speech",
@@ -295,12 +290,6 @@ class ColibriAgentTestSuite(unittest.TestCase):
             "list_saved_facts",
             # Code runner suite
             "run_python_calculation",
-            # Device & Pepper's Ghost 3D Avatar suite
-            "rotate_device",
-            "rotate_device_servo",
-            "set_avatar_state",
-            "trigger_avatar_state",
-            "trigger_hologram_effect",
         }
         self.assertTrue(expected_core_tools.issubset(set(registry.keys())))
         schema_names = {
@@ -310,13 +299,46 @@ class ColibriAgentTestSuite(unittest.TestCase):
         lc_tools = get_langchain_tools()
         self.assertGreaterEqual(len(lc_tools), len(expected_core_tools))
 
+        # Scope creep checks: robotics & device tools purged
+        purged_tools = {
+            "detect_person_angle",
+            "rotate_device",
+            "rotate_device_servo",
+            "set_avatar_state",
+            "trigger_avatar_state",
+            "trigger_hologram_effect",
+        }
+        for purged in purged_tools:
+            self.assertNotIn(purged, registry)
+            self.assertNotIn(purged, schema_names)
+
     def test_persona_and_bilingual_greetings(self) -> None:
         prompt = build_system_prompt("companion")
-        self.assertIn("Noga", prompt)
+        self.assertIn("Jimmy bot", prompt)
+        self.assertIn("ג'ימי בוט", prompt)
+        self.assertIn("Jimmies family", prompt)
+        self.assertIn("משפחת ג'ימי", prompt)
         self.assertIn("he-IL-HilaNeural", prompt)
+        self.assertIn("STRICT BREVITY", prompt)
         self.assertEqual(prompt, COMPANION_PERSONA_PROMPT)
-        self.assertIn("יום הולדת שמח", BIRTHDAY_GREETING_HE)
-        self.assertIn("Happy Birthday", BIRTHDAY_GREETING_EN)
+
+        # Scope creep checks: robotics, servo, holographic cylinder, avatar, face/angle detection purged
+        scope_creep = [
+            "Pepper's Ghost",
+            "holographic cylinder",
+            "motorized",
+            "rotate_device",
+            "set_avatar_state",
+            "trigger_hologram_effect",
+            "detect_person_angle",
+        ]
+        for term in scope_creep:
+            self.assertNotIn(term, prompt)
+
+        # Birthday greetings removed from persona module exports
+        import src.ai.persona as persona_mod
+        self.assertFalse(hasattr(persona_mod, "BIRTHDAY_GREETING_HE"))
+        self.assertFalse(hasattr(persona_mod, "BIRTHDAY_GREETING_EN"))
 
     def test_rag_memory_persistence_and_query(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -347,51 +369,23 @@ class ColibriAgentTestSuite(unittest.TestCase):
                 listed = json.loads(list_saved_facts())
                 self.assertEqual(listed.get("count"), 2)
 
-    def test_device_servo_and_hologram_avatar_hooks(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            state_file = os.path.join(tmpdir, "device_state.json")
-            with patch.dict(os.environ, {"COLIBRI_DEVICE_STATE_PATH": state_file}):
-                # Test angle clamping [-180, 180]
-                rot = json.loads(rotate_device(240))
-                self.assertEqual(rot["status"], "ok")
-                self.assertEqual(rot["servo_angle"], 180)
-                self.assertTrue(rot["clamped"])
-
-                rot2 = json.loads(rotate_device_servo(-45))
-                self.assertEqual(rot2["servo_angle"], -45)
-                self.assertFalse(rot2["clamped"])
-
-                # Test avatar state validation & update
-                av = json.loads(
-                    set_avatar_state(
-                        state="birthday",
-                        emotion="joyful",
-                        subtitle="יום הולדת שמח אהובה!",
-                    )
-                )
-                self.assertEqual(av["status"], "ok")
-                self.assertEqual(av["avatar_state"], "birthday")
-
-                av_alias = json.loads(trigger_avatar_state(state="love", emotion="affectionate"))
-                self.assertEqual(av_alias["avatar_state"], "love")
-
-                av_bad = json.loads(set_avatar_state(state="invalid_state_xyz"))
-                self.assertEqual(av_bad["status"], "error")
-
-                # Test hologram visual effect
-                eff = json.loads(
-                    trigger_hologram_effect(
-                        effect="floating_hearts",
-                        led_rgb="255,105,180",
-                    )
-                )
-                self.assertEqual(eff["status"], "ok")
-                self.assertEqual(eff["hologram_effect"], "floating_hearts")
-
-                persisted = get_device_state()
-                self.assertEqual(persisted["servo_angle"], -45)
-                self.assertEqual(persisted["avatar_state"], "love")
-                self.assertEqual(persisted["hologram_effect"], "floating_hearts")
+    def test_robotics_and_device_tools_purged(self) -> None:
+        """Verify device.py and robotics/servo/avatar/person-angle tools are completely purged."""
+        import src.ai.tools as tools_mod
+        robotics_attrs = [
+            "rotate_device",
+            "rotate_device_servo",
+            "set_avatar_state",
+            "trigger_avatar_state",
+            "trigger_hologram_effect",
+            "get_device_state",
+            "detect_person_angle",
+            "DEVICE_TOOLS",
+            "DEVICE_TOOL_REGISTRY",
+            "DEVICE_TOOLS_SCHEMA",
+        ]
+        for attr in robotics_attrs:
+            self.assertFalse(hasattr(tools_mod, attr), f"{attr} should not be exported from src.ai.tools")
 
     def test_code_runner_and_calculate_sandboxes(self) -> None:
         res = json.loads(calculate("sqrt(144) + 2 ** 5"))
@@ -416,8 +410,8 @@ class ColibriAgentTestSuite(unittest.TestCase):
         ocr_missing = json.loads(extract_text_from_image("/nonexistent/image_12345.png"))
         self.assertIn("error", ocr_missing)
 
-        angle_missing = json.loads(detect_person_angle("/nonexistent/frame_12345.jpg"))
-        self.assertIn("error", angle_missing)
+        scene_missing = json.loads(describe_image_scene("/nonexistent/frame_12345.jpg"))
+        self.assertIn("error", scene_missing)
 
         stt_missing = json.loads(transcribe_audio("/nonexistent/audio_12345.wav"))
         self.assertIn("error", stt_missing)
@@ -480,8 +474,7 @@ class ColibriAgentTestSuite(unittest.TestCase):
 
     def test_graph_state_transitions_and_qwen36_prefix_flags(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            state_file = os.path.join(tmpdir, "device_state.json")
-            with patch.dict(os.environ, {"COLIBRI_DEVICE_STATE_PATH": state_file}):
+            with patch.dict(os.environ, {"COLIBRI_MEMORY_DIR": tmpdir}):
                 with patch.object(urllib.request, "urlopen", side_effect=self.gateway.urlopen):
                     model_id, ctx_len = detect_colibri_model(self.base_url, api_key="test-key")
                     self.assertEqual(model_id, "qwen36-35b")
@@ -534,14 +527,10 @@ class ColibriAgentTestSuite(unittest.TestCase):
                         "Let me calculate sqrt(144) + 25 * 4 using calculate.",
                     )
 
-                    # Verify avatar pulsed to "speaking" on completion
-                    self.assertEqual(get_device_state()["avatar_state"], "speaking")
-
     def test_reflect_and_guard_max_steps_limit(self) -> None:
         self.gateway.mode = "infinite_tools"
         with tempfile.TemporaryDirectory() as tmpdir:
-            state_file = os.path.join(tmpdir, "device_state.json")
-            with patch.dict(os.environ, {"COLIBRI_DEVICE_STATE_PATH": state_file}):
+            with patch.dict(os.environ, {"COLIBRI_MEMORY_DIR": tmpdir}):
                 with patch.object(urllib.request, "urlopen", side_effect=self.gateway.urlopen):
                     cfg = AgentConfig(
                         base_url=self.base_url,
@@ -579,9 +568,9 @@ class ColibriAgentTestSuite(unittest.TestCase):
         self.assertFalse(default_cfg.enable_thinking)
         self.assertLessEqual(default_cfg.max_tokens, 512)
 
-        # 2. Verify deduplicated schemas drop the 6 alias duplicates while keeping all 28 callable
+        # 2. Verify deduplicated schemas drop alias duplicates while keeping unique companion tools
         self.assertEqual(len(OPENAI_TOOLS_SCHEMA) - len(DEDUPLICATED_TOOLS_SCHEMA), len(ALIAS_TOOL_NAMES))
-        self.assertEqual(len(FAST_COMPANION_TOOLS_SCHEMA), 9)
+        self.assertEqual(len(FAST_COMPANION_TOOLS_SCHEMA), 6)
 
         # 3. Verify clause-level TTS streamer chunks first clause eagerly and flushes cleanly
         streamer = SentenceTTSStreamer(voice="auto", play_audio=False, min_first_clause_words=4)
@@ -594,10 +583,9 @@ class ColibriAgentTestSuite(unittest.TestCase):
 
         # 4. Verify zero-roundtrip speculative RAG memory prefetch injects context automatically
         with tempfile.TemporaryDirectory() as tmpdir:
-            state_file = os.path.join(tmpdir, "device_state.json")
             with patch.dict(
                 os.environ,
-                {"COLIBRI_MEMORY_DIR": tmpdir, "COLIBRI_DEVICE_STATE_PATH": state_file},
+                {"COLIBRI_MEMORY_DIR": tmpdir},
             ):
                 save_fact("She loves drinking iced matcha latte every morning.", category="drinks")
                 with patch.object(urllib.request, "urlopen", side_effect=self.gateway.urlopen):
@@ -622,8 +610,8 @@ class ColibriAgentTestSuite(unittest.TestCase):
                     ]
                     self.assertGreaterEqual(len(chat_reqs), 1)
                     first_req = chat_reqs[0]
-                    # Fast companion mode passes only 9 tool schemas on slot 0
-                    self.assertEqual(len(first_req.get("tools", [])), 9)
+                    # Fast companion mode passes only 6 core tool schemas on slot 0
+                    self.assertEqual(len(first_req.get("tools", [])), 6)
                     self.assertEqual(first_req.get("cache_slot"), 0)
                     user_msg = [m for m in first_req["messages"] if m["role"] == "user"][0]["content"]
                     self.assertIn("[LOCAL MEMORY CONTEXT]", user_msg)
@@ -632,8 +620,7 @@ class ColibriAgentTestSuite(unittest.TestCase):
 
         # 5. Verify SystemOne zero-token routing skips tool schemas when choice == 'direct'
         with tempfile.TemporaryDirectory() as tmpdir:
-            state_file = os.path.join(tmpdir, "device_state.json")
-            with patch.dict(os.environ, {"COLIBRI_DEVICE_STATE_PATH": state_file}):
+            with patch.dict(os.environ, {"COLIBRI_MEMORY_DIR": tmpdir}):
                 self.gateway.recorded_requests.clear()
 
                 def _mock_direct_sys1(req: Any, timeout: float = 10.0) -> _MockHTTPResponse:
@@ -689,6 +676,225 @@ class ColibriAgentTestSuite(unittest.TestCase):
                     self.assertEqual(len(chat_reqs_direct), 1)
                     # Verify tools were omitted because SystemOne routed to 'direct'
                     self.assertNotIn("tools", chat_reqs_direct[0])
+
+    def test_multi_collection_segmentation_ingestion_and_recipe_scaling(self) -> None:
+        self.assertEqual(
+            CANONICAL_COLLECTIONS,
+            ("recipes_and_food", "web_bookmarks_and_reads", "personal_facts_and_notes"),
+        )
+        self.assertEqual(_resolve_collection("recipe", "2 cups flour"), "recipes_and_food")
+        self.assertEqual(_resolve_collection("bookmark", "https://example.org/article"), "web_bookmarks_and_reads")
+        self.assertEqual(_resolve_collection("family", "Mom's birthday is in May"), "personal_facts_and_notes")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(os.environ, {"COLIBRI_MEMORY_DIR": tmpdir}):
+                # 1. Ingest a structured family recipe into `recipes_and_food`
+                recipe_text = (
+                    "Jimmies Family Fluffy Pancakes\n"
+                    "Servings: 4\n"
+                    "Ingredients:\n"
+                    "- 1 1/2 cups all-purpose flour\n"
+                    "- 2 tbsp sugar\n"
+                    "- 200 ml milk\n"
+                    "- 1/2 tsp salt\n"
+                    "Steps:\n"
+                    "1. Whisk dry ingredients together in a bowl.\n"
+                    "2. Stir in milk and cook on a buttered griddle until golden."
+                )
+                ingested_rec = json.loads(ingest_url_or_note(recipe_text))
+                self.assertEqual(ingested_rec["status"], "ingested")
+                self.assertEqual(ingested_rec["collection"], "recipes_and_food")
+                self.assertEqual(ingested_rec["servings"], 4.0)
+                self.assertEqual(len(ingested_rec["ingredients"]), 4)
+
+                # 2. Scale the saved recipe from 4 servings to 8 servings (2x)
+                scaled = json.loads(scale_recipe("Fluffy Pancakes", target_servings=8))
+                self.assertEqual(scaled["status"], "ok")
+                self.assertEqual(scaled["base_servings"], 4.0)
+                self.assertEqual(scaled["target_servings"], 8.0)
+                self.assertAlmostEqual(scaled["scale_factor"], 2.0)
+                by_item = {row["item"]: row for row in scaled["scaled_ingredients"]}
+                self.assertAlmostEqual(by_item["all-purpose flour"]["scaled_quantity"], 3.0)
+                self.assertAlmostEqual(by_item["milk"]["scaled_quantity"], 400.0)
+                self.assertAlmostEqual(by_item["salt"]["scaled_quantity"], 1.0)
+
+                # 3. Ingest a web bookmark via mocked `fetch_webpage` into `web_bookmarks_and_reads`
+                with patch(
+                    "src.ai.tools.rag.fetch_webpage",
+                    return_value=(
+                        "Page Title: Apple Silicon Unified Memory Guide\n"
+                        "Source URL: https://example.org/m1-guide\n"
+                        "Extracted Readable Content:\n"
+                        "Apple Silicon M1 shares unified low-latency memory between CPU and Metal GPU cores. "
+                        "This eliminates PCIe copy overhead during Qwen3.6 MoE inference."
+                    ),
+                ):
+                    ingested_bm = json.loads(ingest_url_or_note("https://example.org/m1-guide"))
+                self.assertEqual(ingested_bm["status"], "ingested")
+                self.assertEqual(ingested_bm["collection"], "web_bookmarks_and_reads")
+                self.assertEqual(ingested_bm["title"], "Apple Silicon Unified Memory Guide")
+
+                # 4. Ingest a personal note into `personal_facts_and_notes`
+                ingested_note = json.loads(
+                    ingest_url_or_note(
+                        "The Jimmies family loves Sunday family dinners at 7pm.",
+                        collection_name="personal_facts_and_notes",
+                        title="Sunday Family Dinner",
+                    )
+                )
+                self.assertEqual(ingested_note["collection"], "personal_facts_and_notes")
+
+                # 5. Query segmented collections individually and via federated `companion_memory`
+                rec_search = json.loads(
+                    query_local_knowledge("Pancakes flour", collection_name="recipes_and_food")
+                )
+                self.assertGreaterEqual(len(rec_search["matches"]), 1)
+                self.assertEqual(rec_search["matches"][0]["collection"], "recipes_and_food")
+
+                bm_search = json.loads(
+                    query_local_knowledge("Unified Memory Metal", collection_name="web_bookmarks_and_reads")
+                )
+                self.assertGreaterEqual(len(bm_search["matches"]), 1)
+                self.assertEqual(bm_search["matches"][0]["collection"], "web_bookmarks_and_reads")
+
+                fed_search = json.loads(query_memory("Sunday family dinners", k=3))
+                self.assertTrue(
+                    any("Sunday" in str(m.get("value", "")) for m in fed_search["matches"])
+                )
+
+    def test_rag_strict_context_bounds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(os.environ, {"COLIBRI_MEMORY_DIR": tmpdir, "COLIBRI_MAX_TOOL_CHARS": "600"}):
+                # 1. Test list_saved_facts bounded to COLIBRI_MAX_TOOL_CHARS
+                for i in range(20):
+                    save_fact(f"Family fact number {i}: detail info about preference {i} with long description " * 3)
+                facts_list = list_saved_facts()
+                self.assertLessEqual(len(facts_list), 600)
+
+                # 2. Test ingest_url_or_note bounded to COLIBRI_MAX_TOOL_CHARS on note
+                huge_note = "Detail note content " * 100
+                ingested = ingest_url_or_note(huge_note, title="Huge Note")
+                self.assertLessEqual(len(ingested), 600)
+
+                # 3. Test ingest_url_or_note bounded to COLIBRI_MAX_TOOL_CHARS on scraped URL
+                with patch("src.ai.tools.rag.fetch_webpage", return_value="Scraped Web Content " * 200) as mock_fetch:
+                    ingested_url = ingest_url_or_note("https://example.org/huge-article")
+                    mock_fetch.assert_called_once()
+                    self.assertLessEqual(mock_fetch.call_args[1].get("max_chars", 9999), 600)
+                    self.assertLessEqual(len(ingested_url), 600)
+
+                # 4. Test scale_recipe bounded to COLIBRI_MAX_TOOL_CHARS
+                large_recipe = "\n".join([f"- {i+1} cups ingredient_{i}" for i in range(40)])
+                scaled = scale_recipe(large_recipe, target_servings=10)
+                self.assertLessEqual(len(scaled), 600)
+
+    def test_native_langgraph_checkpointer_integration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "custom_checkpoints.sqlite")
+            custom_cp = ColibriSqliteCheckpointer(db_path=db_path)
+            runner = build_internet_agent_graph(checkpointer=custom_cp)
+            self.assertIs(runner.checkpointer, custom_cp)
+            self.assertEqual(runner.checkpointer.db_path, os.path.abspath(db_path))
+
+            # Test LangGraph native checkpointer interface: put, get_tuple, list
+            cfg = {"configurable": {"thread_id": "session_alpha"}}
+            ckpt = {
+                "v": 1,
+                "id": "chk_001",
+                "channel_values": {
+                    "messages": [{"role": "user", "content": "Hello Jimmy bot"}, {"role": "assistant", "content": "Shalom!"}],
+                    "intent": "conversation",
+                    "step_count": 1,
+                },
+            }
+            meta = {"source": "input", "step": 1}
+            ret_cfg = custom_cp.put(cfg, ckpt, meta)
+            self.assertEqual(ret_cfg.get("configurable", {}).get("thread_id"), "session_alpha")
+
+            tup = custom_cp.get_tuple(cfg)
+            self.assertIsNotNone(tup)
+            self.assertEqual(tup.checkpoint["channel_values"]["intent"], "conversation")
+            self.assertEqual(len(tup.checkpoint["channel_values"]["messages"]), 2)
+
+            all_ckpts = list(custom_cp.list(cfg))
+            self.assertEqual(len(all_ckpts), 1)
+            self.assertEqual(all_ckpts[0].config["configurable"]["thread_id"], "session_alpha")
+
+    def test_intent_classification_and_sqlite_checkpoint_persistence(self) -> None:
+        self.assertEqual(
+            classify_user_intent("Please ingest https://example.org/pancake-recipe into my vault"),
+            "url_ingestion",
+        )
+        self.assertEqual(
+            classify_user_intent("Scale the pancake recipe for 8 servings"),
+            "recipe_scaling",
+        )
+        self.assertEqual(
+            classify_user_intent("What is her favorite song from my memory vault?"),
+            "memory_recall",
+        )
+        self.assertEqual(
+            classify_user_intent("What is the weather in Tel Aviv and calculate 12 * 12?"),
+            "factual_extraction",
+        )
+        self.assertEqual(
+            classify_user_intent("Hey Jimmy bot, how are you doing today?"),
+            "conversation",
+        )
+        self.assertEqual(COMPANION_NAME, "Jimmy bot")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                os.environ,
+                {"COLIBRI_MEMORY_DIR": tmpdir},
+            ):
+                with patch.object(urllib.request, "urlopen", side_effect=self.gateway.urlopen):
+                    cfg = AgentConfig(
+                        base_url=self.base_url,
+                        api_key="test-key",
+                        model="qwen36-35b",
+                        prefetch_memory=False,
+                    )
+                    res1 = run_agent(
+                        "Calculate sqrt(144) + 25 * 4",
+                        config=cfg,
+                        force_stdlib=True,
+                        thread_id="jimmies_family_session_1",
+                    )
+                    self.assertEqual(res1.intent, "factual_extraction")
+                    self.assertEqual(res1.thread_id, "jimmies_family_session_1")
+                    self.assertTrue(os.path.isfile(os.path.join(tmpdir, "checkpoints.sqlite")))
+
+                    persisted_hist = get_session_history("jimmies_family_session_1")
+                    self.assertGreaterEqual(len(persisted_hist), 2)
+                    self.assertEqual(persisted_hist[0]["role"], "user")
+                    self.assertIn("sqrt(144)", persisted_hist[0]["content"])
+
+                    # Second turn on the same thread_id automatically restores prior conversation history
+                    self.gateway.recorded_requests.clear()
+                    res2 = run_agent(
+                        "Scale the pancake recipe for 6 servings",
+                        config=cfg,
+                        force_stdlib=True,
+                        thread_id="jimmies_family_session_1",
+                    )
+                    self.assertEqual(res2.intent, "recipe_scaling")
+                    chat_reqs = [
+                        r["body"]
+                        for r in self.gateway.recorded_requests
+                        if r["url"].endswith("/chat/completions")
+                    ]
+                    self.assertGreaterEqual(len(chat_reqs), 1)
+                    sent_msgs = chat_reqs[0]["messages"]
+                    # System prompt at index 0 + restored Turn 1 user/assistant/tool messages + Turn 2 user message
+                    self.assertEqual(sent_msgs[0]["role"], "system")
+                    self.assertTrue(
+                        any("sqrt(144)" in str(m.get("content", "")) for m in sent_msgs if m.get("role") == "user")
+                    )
+
+                    cp = ColibriSqliteCheckpointer().load_checkpoint("jimmies_family_session_1")
+                    self.assertIsNotNone(cp)
+                    self.assertEqual(cp["intent"], "recipe_scaling")
 
 
 if __name__ == "__main__":

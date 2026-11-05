@@ -46,9 +46,6 @@
 #include <string.h>
 #include <math.h>
 
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
-#include <immintrin.h>
-#endif
 #if defined(__ARM_NEON) && defined(__aarch64__)
 #include <arm_neon.h>
 #endif
@@ -71,24 +68,7 @@ static inline int    xf_layout_ok(int I) { return I > 0 && (I % XF_BLOCK) == 0; 
  * overlap. I % 64 == 0. */
 static inline void xf_repack_row_pairs_signed(uint8_t *dst, const uint8_t *src, int I) {
     int b = 0;
-#if defined(__AVX2__)
-    /* 16 pair bytes hold elements 0..31: the low nibbles are the even ones,
-     * the high nibbles the odd ones, so interleaving the two nibble vectors
-     * byte-wise puts elements 0..31 in order. Same for 32..63 from the next 16
-     * bytes; xor 8 turns the signed nibble into v+8; the block is lo | hi<<4. */
-    const __m128i m4 = _mm_set1_epi8(0x0F);
-    const __m256i e8 = _mm256_set1_epi8(8);
-    for (; b < I / XF_BLOCK; b++) {
-        const uint8_t *s = src + (size_t)b * XF_BLOCK_BYTES;
-        __m128i a = _mm_loadu_si128((const __m128i *)s), c = _mm_loadu_si128((const __m128i *)(s + 16));
-        __m128i al = _mm_and_si128(a, m4), ah = _mm_and_si128(_mm_srli_epi16(a, 4), m4);
-        __m128i cl = _mm_and_si128(c, m4), ch = _mm_and_si128(_mm_srli_epi16(c, 4), m4);
-        __m256i e0 = _mm256_set_m128i(_mm_unpackhi_epi8(al, ah), _mm_unpacklo_epi8(al, ah));   /* elements 0..31 */
-        __m256i e1 = _mm256_set_m128i(_mm_unpackhi_epi8(cl, ch), _mm_unpacklo_epi8(cl, ch));   /* elements 32..63 */
-        e0 = _mm256_xor_si256(e0, e8); e1 = _mm256_xor_si256(e1, e8);
-        _mm256_storeu_si256((__m256i *)(dst + (size_t)b * XF_BLOCK_BYTES), _mm256_or_si256(e0, _mm256_slli_epi16(e1, 4)));
-    }
-#elif defined(__ARM_NEON) && defined(__aarch64__)
+#if defined(__ARM_NEON) && defined(__aarch64__)
 #define XF_REPACK_NEON 1   /* this path is compiled in: tests/test_expert_ffn.c checks it on AArch64 */
     /* The same pairing, built directly: byte j of `even` is element 2j in the
      * low nibble and element 32+2j in the high one, `odd` the same for 2j+1,
@@ -136,13 +116,44 @@ static inline int xf_get(const uint8_t *row, int i) {
  * f32 (exact: |sum| <= 64*127). Returns the scale. */
 static inline float xf_act_i8(const float *x, int I, int8_t *xq, float *xsum) {
     float am = 0.f;
-    for (int i = 0; i < I; i++) { float a = fabsf(x[i]); if (a > am) am = a; }
+    int i = 0;
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    float32x4_t am0 = vdupq_n_f32(0.f), am1 = vdupq_n_f32(0.f);
+    for (; i + 8 <= I; i += 8) {
+        am0 = vmaxq_f32(am0, vabsq_f32(vld1q_f32(x + i)));
+        am1 = vmaxq_f32(am1, vabsq_f32(vld1q_f32(x + i + 4)));
+    }
+    am = vmaxvq_f32(vmaxq_f32(am0, am1));
+#endif
+    for (; i < I; i++) { float a = fabsf(x[i]); if (a > am) am = a; }
     float s = am > 0.f ? am / 127.f : 1.f, inv = 1.f / s;
-    for (int i = 0; i < I; i++) xq[i] = (int8_t)lrintf(x[i] * inv);
+    i = 0;
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    const float32x4_t vinv = vdupq_n_f32(inv);
+    for (; i + 16 <= I; i += 16) {
+        int32x4_t a = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(x + i),      vinv));
+        int32x4_t b = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(x + i + 4),  vinv));
+        int32x4_t c = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(x + i + 8),  vinv));
+        int32x4_t d = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(x + i + 12), vinv));
+        int16x8_t ab = vcombine_s16(vqmovn_s32(a), vqmovn_s32(b));
+        int16x8_t cd = vcombine_s16(vqmovn_s32(c), vqmovn_s32(d));
+        vst1q_s8(xq + i, vcombine_s8(vqmovn_s16(ab), vqmovn_s16(cd)));
+    }
+#endif
+    for (; i < I; i++) xq[i] = (int8_t)lrintf(x[i] * inv);
     for (int g = 0; g < I / XF_BLOCK; g++) {
-        int32_t t = 0;
-        for (int i = 0; i < XF_BLOCK; i++) t += xq[g * XF_BLOCK + i];
+#if defined(__ARM_NEON) && defined(__aarch64__)
+        const int8_t *p = xq + g * XF_BLOCK;
+        int32_t t = (int32_t)vaddlvq_s8(vld1q_s8(p))
+                  + (int32_t)vaddlvq_s8(vld1q_s8(p + 16))
+                  + (int32_t)vaddlvq_s8(vld1q_s8(p + 32))
+                  + (int32_t)vaddlvq_s8(vld1q_s8(p + 48));
         xsum[g] = (float)t;
+#else
+        int32_t t = 0;
+        for (int k = 0; k < XF_BLOCK; k++) t += xq[g * XF_BLOCK + k];
+        xsum[g] = (float)t;
+#endif
     }
     return s;
 }
@@ -195,124 +206,126 @@ static inline float xf_dot_i8_ref(const uint8_t *w, const float *sc, const int8_
 
 /* ---- SIMD kernels ---------------------------------------------------------- */
 
-#if defined(__AVX2__) && defined(__FMA__)
-#define XF_HAVE_AVX2 1
-static inline float xf_hsum8(__m256 v) {
-    __m128 lo = _mm256_castps256_ps128(v), hi = _mm256_extractf128_ps(v, 1);
-    __m128 a = _mm_add_ps(lo, hi);                       /* l+l+4 */
-    __m128 b = _mm_add_ps(a, _mm_movehl_ps(a, a));       /* (0+4)+(2+6), (1+5)+(3+7) */
-    __m128 c = _mm_add_ss(b, _mm_shuffle_ps(b, b, 1));
-    return _mm_cvtss_f32(c);
+#if defined(__ARM_NEON) && defined(__aarch64__)
+#define XF_HAVE_NEON 1
+static inline float xf_hsum8_neon(float32x4_t acc0, float32x4_t acc1) {
+    float32x4_t a = vaddq_f32(acc0, acc1);                /* l + (l+4) */
+    float32x2_t b = vadd_f32(vget_low_f32(a), vget_high_f32(a)); /* (0+4)+(2+6), (1+5)+(3+7) */
+    return vget_lane_f32(vpadd_f32(b, b), 0);
 }
-/* nibbles of one 32-byte block as two 32-lane signed int8 vectors (v = u-8) */
-static inline void xf_nib_s8(__m256i bb, __m256i *lo, __m256i *hi) {
-    const __m256i m4 = _mm256_set1_epi8(0x0F), e8 = _mm256_set1_epi8(8);
-    *lo = _mm256_sub_epi8(_mm256_and_si256(bb, m4), e8);
-    *hi = _mm256_sub_epi8(_mm256_and_si256(_mm256_srli_epi16(bb, 4), m4), e8);
+static inline void xf_widen16_s8_f32(int8x16_t v, float32x4_t *f0, float32x4_t *f1, float32x4_t *f2, float32x4_t *f3) {
+    int16x8_t wlo = vmovl_s8(vget_low_s8(v)), whi = vmovl_s8(vget_high_s8(v));
+    *f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(wlo)));
+    *f1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(wlo)));
+    *f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(whi)));
+    *f3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(whi)));
 }
-/* No 512-bit f32 path on purpose: element i must land in lane i&7 in the
- * reference's order, and folding 16 lanes onto 8 changes the fma order. The
- * i8 path is exact integers and could widen; it is DRAM-bound already. */
-
-/* f32 row dot, AVX2: 8 lanes per element octet, lane = i&7 */
-static inline float xf_dot_f32_avx2(const uint8_t *w, const float *sc, const float *x, int I) {
-    __m256 acc = _mm256_setzero_ps();
+static inline float xf_dot_f32_neon(const uint8_t *w, const float *sc, const float *x, int I) {
+    const uint8x16_t m4 = vdupq_n_u8(0x0F);
+    const int8x16_t e8 = vdupq_n_s8(8);
+    float32x4_t acc0 = vdupq_n_f32(0.f), acc1 = vdupq_n_f32(0.f);
     for (int g = 0; g < I / XF_BLOCK; g++) {
-        __m256i bb = _mm256_loadu_si256((const __m256i *)(w + (size_t)g * XF_BLOCK_BYTES));
-        __m256i lo, hi; xf_nib_s8(bb, &lo, &hi);
+        const uint8_t *blk = w + (size_t)g * XF_BLOCK_BYTES;
+        uint8x16_t b0 = vld1q_u8(blk), b1 = vld1q_u8(blk + 16);
+        int8x16_t lo0 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(b0, m4)), e8);
+        int8x16_t lo1 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(b1, m4)), e8);
+        int8x16_t hi0 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(b0, 4)), e8);
+        int8x16_t hi1 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(b1, 4)), e8);
         const float *xb = x + g * XF_BLOCK;
-        __m128i lo0 = _mm256_castsi256_si128(lo), lo1 = _mm256_extracti128_si256(lo, 1);
-        __m128i hi0 = _mm256_castsi256_si128(hi), hi1 = _mm256_extracti128_si256(hi, 1);
-        __m256 lane = _mm256_setzero_ps();
-        lane = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo0)),                    _mm256_loadu_ps(xb),      lane);
-        lane = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(lo0, 8))), _mm256_loadu_ps(xb + 8),  lane);
-        lane = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo1)),                    _mm256_loadu_ps(xb + 16), lane);
-        lane = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(lo1, 8))), _mm256_loadu_ps(xb + 24), lane);
-        lane = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi0)),                    _mm256_loadu_ps(xb + 32), lane);
-        lane = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(hi0, 8))), _mm256_loadu_ps(xb + 40), lane);
-        lane = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi1)),                    _mm256_loadu_ps(xb + 48), lane);
-        lane = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(hi1, 8))), _mm256_loadu_ps(xb + 56), lane);
-        acc = _mm256_fmadd_ps(lane, _mm256_set1_ps(sc[g]), acc);
+        float32x4_t lane0 = vdupq_n_f32(0.f), lane1 = vdupq_n_f32(0.f);
+        float32x4_t f0, f1, f2, f3;
+        xf_widen16_s8_f32(lo0, &f0, &f1, &f2, &f3);
+        lane0 = vfmaq_f32(lane0, f0, vld1q_f32(xb));      lane1 = vfmaq_f32(lane1, f1, vld1q_f32(xb + 4));
+        lane0 = vfmaq_f32(lane0, f2, vld1q_f32(xb + 8));  lane1 = vfmaq_f32(lane1, f3, vld1q_f32(xb + 12));
+        xf_widen16_s8_f32(lo1, &f0, &f1, &f2, &f3);
+        lane0 = vfmaq_f32(lane0, f0, vld1q_f32(xb + 16)); lane1 = vfmaq_f32(lane1, f1, vld1q_f32(xb + 20));
+        lane0 = vfmaq_f32(lane0, f2, vld1q_f32(xb + 24)); lane1 = vfmaq_f32(lane1, f3, vld1q_f32(xb + 28));
+        xf_widen16_s8_f32(hi0, &f0, &f1, &f2, &f3);
+        lane0 = vfmaq_f32(lane0, f0, vld1q_f32(xb + 32)); lane1 = vfmaq_f32(lane1, f1, vld1q_f32(xb + 36));
+        lane0 = vfmaq_f32(lane0, f2, vld1q_f32(xb + 40)); lane1 = vfmaq_f32(lane1, f3, vld1q_f32(xb + 44));
+        xf_widen16_s8_f32(hi1, &f0, &f1, &f2, &f3);
+        lane0 = vfmaq_f32(lane0, f0, vld1q_f32(xb + 48)); lane1 = vfmaq_f32(lane1, f1, vld1q_f32(xb + 52));
+        lane0 = vfmaq_f32(lane0, f2, vld1q_f32(xb + 56)); lane1 = vfmaq_f32(lane1, f3, vld1q_f32(xb + 60));
+        float32x4_t scv = vdupq_n_f32(sc[g]);
+        acc0 = vfmaq_f32(acc0, lane0, scv);
+        acc1 = vfmaq_f32(acc1, lane1, scv);
     }
-    return xf_hsum8(acc);
+    return xf_hsum8_neon(acc0, acc1);
 }
 
-/* i8 row dot: unsigned nibbles x int8 activations, 8 int32 lanes per block */
-#if defined(__AVXVNNI__) || (defined(__AVX512VNNI__) && defined(__AVX512VL__))
-#define XF_HAVE_VNNI 1
-#if defined(__AVXVNNI__) && !defined(__AVX512VNNI__)
-#define xf_dpbusd(acc, u, x) _mm256_dpbusd_avx_epi32(acc, u, x)
-#else
-#define xf_dpbusd(acc, u, x) _mm256_dpbusd_epi32(acc, u, x)
-#endif
-#else
-static inline __m256i xf_dpbusd(__m256i acc, __m256i u, __m256i x) {
-    /* u <= 15, |x| <= 127: a pair sum fits int16 (<= 3810) */
-    return _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(u, x), _mm256_set1_epi16(1)));
-}
-#endif
-static inline float xf_dot_i8_avx2(const uint8_t *w, const float *sc, const int8_t *xq, const float *xsum, float sx, int I) {
-    const __m256i m4 = _mm256_set1_epi8(0x0F), z = _mm256_setzero_si256();
-    __m256 acc = _mm256_setzero_ps();
-    int ng = I / XF_BLOCK, g = 0;
-    for (; g < ng; g++) {
-        __m256i bb = _mm256_loadu_si256((const __m256i *)(w + (size_t)g * XF_BLOCK_BYTES));
+#if defined(__ARM_FEATURE_DOTPROD)
+static inline float xf_dot_i8_neon(const uint8_t *w, const float *sc, const int8_t *xq, const float *xsum, float sx, int I) {
+    const uint8x16_t m4 = vdupq_n_u8(0x0F);
+    const int32x4_t z = vdupq_n_s32(0);
+    float32x4_t acc0 = vdupq_n_f32(0.f), acc1 = vdupq_n_f32(0.f);
+    int ng = I / XF_BLOCK;
+    for (int g = 0; g < ng; g++) {
+        const uint8_t *blk = w + (size_t)g * XF_BLOCK_BYTES;
         const int8_t *xb = xq + g * XF_BLOCK;
-        __m256i d = xf_dpbusd(z, _mm256_and_si256(bb, m4), _mm256_loadu_si256((const __m256i *)xb));
-        d = xf_dpbusd(d, _mm256_and_si256(_mm256_srli_epi16(bb, 4), m4), _mm256_loadu_si256((const __m256i *)(xb + 32)));
-        acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(d), _mm256_set1_ps(sc[g]), acc);
+        uint8x16_t b0 = vld1q_u8(blk), b1 = vld1q_u8(blk + 16);
+        int32x4_t d0 = vdotq_s32(z, vreinterpretq_s8_u8(vandq_u8(b0, m4)), vld1q_s8(xb));
+        int32x4_t d1 = vdotq_s32(z, vreinterpretq_s8_u8(vandq_u8(b1, m4)), vld1q_s8(xb + 16));
+        d0 = vdotq_s32(d0, vreinterpretq_s8_u8(vshrq_n_u8(b0, 4)), vld1q_s8(xb + 32));
+        d1 = vdotq_s32(d1, vreinterpretq_s8_u8(vshrq_n_u8(b1, 4)), vld1q_s8(xb + 48));
+        float32x4_t scv = vdupq_n_f32(sc[g]);
+        acc0 = vfmaq_f32(acc0, vcvtq_f32_s32(d0), scv);
+        acc1 = vfmaq_f32(acc1, vcvtq_f32_s32(d1), scv);
     }
-    /* corr = sum_g sc[g]*xsum[g] in the scalar reference's order (sequential fma) */
     float c = 0.f;
-    for (g = 0; g < ng; g++) c = fmaf(sc[g], xsum[g], c);
-    return (xf_hsum8(acc) - 8.f * c) * sx;
+    for (int g = 0; g < ng; g++) c = fmaf(sc[g], xsum[g], c);
+    return (xf_hsum8_neon(acc0, acc1) - 8.f * c) * sx;
 }
-#endif /* AVX2 */
+#endif
+#endif /* XF_HAVE_NEON */
 
 /* ---- dispatch -------------------------------------------------------------- */
 
 static inline float xf_dot_f32(const uint8_t *w, const float *sc, const float *x, int I) {
-#ifdef XF_HAVE_AVX2
-    return xf_dot_f32_avx2(w, sc, x, I);
+#ifdef XF_HAVE_NEON
+    return xf_dot_f32_neon(w, sc, x, I);
 #else
     return xf_dot_f32_ref(w, sc, x, I);
 #endif
 }
-/* xf_dot_f32 for up to XF_F32_ROWS activation rows of one weight row (x[s] each): a
- * block's nibbles widened to floats once, then every row's fmas in xf_dot_f32_avx2's
- * order, so each row's bits are xf_dot_f32's whatever S. With an MTP verify's rows the
- * widening (16 conversions a block) is paid once instead of once a row. */
 #define XF_F32_ROWS 4
-#ifdef XF_HAVE_AVX2
+#ifdef XF_HAVE_NEON
 static inline __attribute__((always_inline)) void xf_dot_f32_rows_body(float *y, int ystride, const uint8_t *w, const float *sc,
                                                                       const float *const *x, int I, const int S) {
-    __m256 acc[XF_F32_ROWS];
-    for (int s = 0; s < S; s++) acc[s] = _mm256_setzero_ps();
+    const uint8x16_t m4 = vdupq_n_u8(0x0F);
+    const int8x16_t e8 = vdupq_n_s8(8);
+    float32x4_t acc0[XF_F32_ROWS], acc1[XF_F32_ROWS];
+    for (int s = 0; s < S; s++) { acc0[s] = vdupq_n_f32(0.f); acc1[s] = vdupq_n_f32(0.f); }
     for (int g = 0; g < I / XF_BLOCK; g++) {
-        __m256i bb = _mm256_loadu_si256((const __m256i *)(w + (size_t)g * XF_BLOCK_BYTES));
-        __m256i lo, hi; xf_nib_s8(bb, &lo, &hi);
-        __m128i lo0 = _mm256_castsi256_si128(lo), lo1 = _mm256_extracti128_si256(lo, 1);
-        __m128i hi0 = _mm256_castsi256_si128(hi), hi1 = _mm256_extracti128_si256(hi, 1);
-        const __m256 wf[8] = {
-            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo0)), _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(lo0, 8))),
-            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo1)), _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(lo1, 8))),
-            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi0)), _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(hi0, 8))),
-            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi1)), _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(hi1, 8))) };
-        const __m256 scv = _mm256_set1_ps(sc[g]);
+        const uint8_t *blk = w + (size_t)g * XF_BLOCK_BYTES;
+        uint8x16_t b0 = vld1q_u8(blk), b1 = vld1q_u8(blk + 16);
+        int8x16_t lo0 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(b0, m4)), e8);
+        int8x16_t lo1 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(b1, m4)), e8);
+        int8x16_t hi0 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(b0, 4)), e8);
+        int8x16_t hi1 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(b1, 4)), e8);
+        float32x4_t wf[16];
+        xf_widen16_s8_f32(lo0, &wf[0],  &wf[1],  &wf[2],  &wf[3]);
+        xf_widen16_s8_f32(lo1, &wf[4],  &wf[5],  &wf[6],  &wf[7]);
+        xf_widen16_s8_f32(hi0, &wf[8],  &wf[9],  &wf[10], &wf[11]);
+        xf_widen16_s8_f32(hi1, &wf[12], &wf[13], &wf[14], &wf[15]);
+        const float32x4_t scv = vdupq_n_f32(sc[g]);
         for (int s = 0; s < S; s++) {
             const float *xb = x[s] + g * XF_BLOCK;
-            __m256 lane = _mm256_setzero_ps();
-            for (int k = 0; k < 8; k++) lane = _mm256_fmadd_ps(wf[k], _mm256_loadu_ps(xb + 8 * k), lane);
-            acc[s] = _mm256_fmadd_ps(lane, scv, acc[s]);
+            float32x4_t l0 = vdupq_n_f32(0.f), l1 = vdupq_n_f32(0.f);
+            for (int k = 0; k < 8; k++) {
+                l0 = vfmaq_f32(l0, wf[2 * k],     vld1q_f32(xb + 8 * k));
+                l1 = vfmaq_f32(l1, wf[2 * k + 1], vld1q_f32(xb + 8 * k + 4));
+            }
+            acc0[s] = vfmaq_f32(acc0[s], l0, scv);
+            acc1[s] = vfmaq_f32(acc1[s], l1, scv);
         }
     }
-    for (int s = 0; s < S; s++) y[(size_t)s * ystride] = xf_hsum8(acc[s]);
+    for (int s = 0; s < S; s++) y[(size_t)s * ystride] = xf_hsum8_neon(acc0[s], acc1[s]);
 }
 #endif
 static inline void xf_dot_f32_rows(float *y, int ystride, const uint8_t *w, const float *sc, const float *const *x, int I, int S) {
     for (int s0 = 0; s0 < S; s0 += XF_F32_ROWS) {
         const int n = S - s0 < XF_F32_ROWS ? S - s0 : XF_F32_ROWS;
-#ifdef XF_HAVE_AVX2
+#ifdef XF_HAVE_NEON
         switch (n) {
         case 1: xf_dot_f32_rows_body(y + (size_t)s0 * ystride, ystride, w, sc, x + s0, I, 1); break;
         case 2: xf_dot_f32_rows_body(y + (size_t)s0 * ystride, ystride, w, sc, x + s0, I, 2); break;
@@ -325,47 +338,49 @@ static inline void xf_dot_f32_rows(float *y, int ystride, const uint8_t *w, cons
     }
 }
 static inline float xf_dot_i8(const uint8_t *w, const float *sc, const int8_t *xq, const float *xsum, float sx, int I) {
-#ifdef XF_HAVE_AVX2
-    return xf_dot_i8_avx2(w, sc, xq, xsum, sx, I);
+#if defined(XF_HAVE_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    return xf_dot_i8_neon(w, sc, xq, xsum, sx, I);
 #else
     return xf_dot_i8_ref(w, sc, xq, xsum, sx, I);
 #endif
 }
 
-/* n (1..XF_MAX_ROWS) activation rows against one weight row, y[r*ystride] =
- * xf_dot_i8(w, sc, xq + r*I, xsum + r*(I/64), sx[r], I): each block's nibbles split
- * once for every row (an MTP verify of 3 rows decoded the row 3 times), each row's
- * arithmetic xf_dot_i8's, so the bits are its. */
 #define XF_MAX_ROWS 4
-#ifdef XF_HAVE_AVX2
+#if defined(XF_HAVE_NEON) && defined(__ARM_FEATURE_DOTPROD)
 static inline __attribute__((always_inline)) void xf_dot_i8_rows_body(float *y, int ystride, const uint8_t *w, const float *sc,
                                                                       const int8_t *xq, const float *xsum, const float *sx, int I, const int n) {
-    const __m256i m4 = _mm256_set1_epi8(0x0F), z = _mm256_setzero_si256();
-    __m256 acc[XF_MAX_ROWS];
-    for (int r = 0; r < n; r++) acc[r] = _mm256_setzero_ps();
+    const uint8x16_t m4 = vdupq_n_u8(0x0F);
+    const int32x4_t z = vdupq_n_s32(0);
+    float32x4_t acc0[XF_MAX_ROWS], acc1[XF_MAX_ROWS];
+    for (int r = 0; r < n; r++) { acc0[r] = vdupq_n_f32(0.f); acc1[r] = vdupq_n_f32(0.f); }
     const int ng = I / XF_BLOCK;
     for (int g = 0; g < ng; g++) {
-        __m256i bb = _mm256_loadu_si256((const __m256i *)(w + (size_t)g * XF_BLOCK_BYTES));
-        __m256i lo = _mm256_and_si256(bb, m4), hi = _mm256_and_si256(_mm256_srli_epi16(bb, 4), m4);
-        __m256 scg = _mm256_set1_ps(sc[g]);
+        const uint8_t *blk = w + (size_t)g * XF_BLOCK_BYTES;
+        uint8x16_t b0 = vld1q_u8(blk), b1 = vld1q_u8(blk + 16);
+        int8x16_t lo0 = vreinterpretq_s8_u8(vandq_u8(b0, m4)), lo1 = vreinterpretq_s8_u8(vandq_u8(b1, m4));
+        int8x16_t hi0 = vreinterpretq_s8_u8(vshrq_n_u8(b0, 4)), hi1 = vreinterpretq_s8_u8(vshrq_n_u8(b1, 4));
+        float32x4_t scg = vdupq_n_f32(sc[g]);
         for (int r = 0; r < n; r++) {
             const int8_t *xb = xq + (size_t)r * I + g * XF_BLOCK;
-            __m256i d = xf_dpbusd(z, lo, _mm256_loadu_si256((const __m256i *)xb));
-            d = xf_dpbusd(d, hi, _mm256_loadu_si256((const __m256i *)(xb + 32)));
-            acc[r] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(d), scg, acc[r]);
+            int32x4_t d0 = vdotq_s32(z, lo0, vld1q_s8(xb));
+            int32x4_t d1 = vdotq_s32(z, lo1, vld1q_s8(xb + 16));
+            d0 = vdotq_s32(d0, hi0, vld1q_s8(xb + 32));
+            d1 = vdotq_s32(d1, hi1, vld1q_s8(xb + 48));
+            acc0[r] = vfmaq_f32(acc0[r], vcvtq_f32_s32(d0), scg);
+            acc1[r] = vfmaq_f32(acc1[r], vcvtq_f32_s32(d1), scg);
         }
     }
     for (int r = 0; r < n; r++) {
         const float *xs = xsum + (size_t)r * ng;
         float c = 0.f;
         for (int g = 0; g < ng; g++) c = fmaf(sc[g], xs[g], c);
-        y[(size_t)r * ystride] = (xf_hsum8(acc[r]) - 8.f * c) * sx[r];
+        y[(size_t)r * ystride] = (xf_hsum8_neon(acc0[r], acc1[r]) - 8.f * c) * sx[r];
     }
 }
 #endif
 static inline void xf_dot_i8_rows(float *y, int ystride, const uint8_t *w, const float *sc, const int8_t *xq,
                                   const float *xsum, const float *sx, int I, int n) {
-#ifdef XF_HAVE_AVX2
+#if defined(XF_HAVE_NEON) && defined(__ARM_FEATURE_DOTPROD)
     switch (n) {
     case 1: xf_dot_i8_rows_body(y, ystride, w, sc, xq, xsum, sx, I, 1); break;
     case 2: xf_dot_i8_rows_body(y, ystride, w, sc, xq, xsum, sx, I, 2); break;
@@ -449,160 +464,106 @@ static inline float xf16_ref(const uint8_t *w, const float *sc, const int8_t *xq
     }
     return acc;
 }
-#if defined(__AVX2__) && defined(__FMA__)
+#if defined(__ARM_NEON) && defined(__aarch64__) && defined(__ARM_FEATURE_DOTPROD)
 #define XF16_ON 1   /* the interleaved form has kernels in this build: the engines may make it */
 static inline int32_t xf16_ld32(const int8_t *p) { int32_t v; memcpy(&v, p, 4); return v; }
-/* gq_quant_block_avx2's codes, scale and sums for a block of 32: its bits */
 static inline void xf_act32_block(const float *v, int8_t *q, float *d, int32_t *s16) {
-    const __m256 sign = _mm256_set1_ps(-0.f);
-    const __m256 v0 = _mm256_loadu_ps(v), v1 = _mm256_loadu_ps(v + 8), v2 = _mm256_loadu_ps(v + 16), v3 = _mm256_loadu_ps(v + 24);
-    const __m256 a = _mm256_max_ps(_mm256_max_ps(_mm256_andnot_ps(sign, v0), _mm256_andnot_ps(sign, v1)),
-                                   _mm256_max_ps(_mm256_andnot_ps(sign, v2), _mm256_andnot_ps(sign, v3)));
-    __m128 m = _mm_max_ps(_mm256_castps256_ps128(a), _mm256_extractf128_ps(a, 1));
-    m = _mm_max_ps(m, _mm_movehl_ps(m, m)); m = _mm_max_ss(m, _mm_movehdup_ps(m));
-    const float amax = _mm_cvtss_f32(m);
+    const float32x4_t v0 = vld1q_f32(v),      v1 = vld1q_f32(v + 4),  v2 = vld1q_f32(v + 8),  v3 = vld1q_f32(v + 12);
+    const float32x4_t v4 = vld1q_f32(v + 16), v5 = vld1q_f32(v + 20), v6 = vld1q_f32(v + 24), v7 = vld1q_f32(v + 28);
+    const float32x4_t a0 = vmaxq_f32(vmaxq_f32(vabsq_f32(v0), vabsq_f32(v1)), vmaxq_f32(vabsq_f32(v2), vabsq_f32(v3)));
+    const float32x4_t a1 = vmaxq_f32(vmaxq_f32(vabsq_f32(v4), vabsq_f32(v5)), vmaxq_f32(vabsq_f32(v6), vabsq_f32(v7)));
+    const float amax = vmaxvq_f32(vmaxq_f32(a0, a1));
     const float id = amax > 0.f ? 127.f / amax : 0.f;
     *d = amax / 127.f;
-    const __m256 idv = _mm256_set1_ps(id);
-    const __m256i lo = _mm256_set1_epi32(-127), hi = _mm256_set1_epi32(127);
-    const __m256i q0 = _mm256_min_epi32(_mm256_max_epi32(_mm256_cvtps_epi32(_mm256_mul_ps(v0, idv)), lo), hi);
-    const __m256i q1 = _mm256_min_epi32(_mm256_max_epi32(_mm256_cvtps_epi32(_mm256_mul_ps(v1, idv)), lo), hi);
-    const __m256i q2 = _mm256_min_epi32(_mm256_max_epi32(_mm256_cvtps_epi32(_mm256_mul_ps(v2, idv)), lo), hi);
-    const __m256i q3 = _mm256_min_epi32(_mm256_max_epi32(_mm256_cvtps_epi32(_mm256_mul_ps(v3, idv)), lo), hi);
-    const __m256i p = _mm256_packs_epi16(_mm256_packs_epi32(q0, q1), _mm256_packs_epi32(q2, q3));
-    _mm256_storeu_si256((__m256i *)q, _mm256_permutevar8x32_epi32(p, _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7)));
-    __m256i t0 = _mm256_add_epi32(q0, q1), t1 = _mm256_add_epi32(q2, q3);
-    __m128i u0 = _mm_add_epi32(_mm256_castsi256_si128(t0), _mm256_extracti128_si256(t0, 1));
-    __m128i u1 = _mm_add_epi32(_mm256_castsi256_si128(t1), _mm256_extracti128_si256(t1, 1));
-    u0 = _mm_hadd_epi32(u0, u1); u0 = _mm_hadd_epi32(u0, u0);
-    s16[0] = _mm_cvtsi128_si32(u0); s16[1] = _mm_extract_epi32(u0, 1);
+    const float32x4_t idv = vdupq_n_f32(id);
+    const int32x4_t lo = vdupq_n_s32(-127), hi = vdupq_n_s32(127);
+    const int32x4_t q0 = vminq_s32(vmaxq_s32(vcvtnq_s32_f32(vmulq_f32(v0, idv)), lo), hi);
+    const int32x4_t q1 = vminq_s32(vmaxq_s32(vcvtnq_s32_f32(vmulq_f32(v1, idv)), lo), hi);
+    const int32x4_t q2 = vminq_s32(vmaxq_s32(vcvtnq_s32_f32(vmulq_f32(v2, idv)), lo), hi);
+    const int32x4_t q3 = vminq_s32(vmaxq_s32(vcvtnq_s32_f32(vmulq_f32(v3, idv)), lo), hi);
+    const int32x4_t q4 = vminq_s32(vmaxq_s32(vcvtnq_s32_f32(vmulq_f32(v4, idv)), lo), hi);
+    const int32x4_t q5 = vminq_s32(vmaxq_s32(vcvtnq_s32_f32(vmulq_f32(v5, idv)), lo), hi);
+    const int32x4_t q6 = vminq_s32(vmaxq_s32(vcvtnq_s32_f32(vmulq_f32(v6, idv)), lo), hi);
+    const int32x4_t q7 = vminq_s32(vmaxq_s32(vcvtnq_s32_f32(vmulq_f32(v7, idv)), lo), hi);
+    vst1q_s8(q,      vcombine_s8(vqmovn_s16(vcombine_s16(vqmovn_s32(q0), vqmovn_s32(q1))),
+                                 vqmovn_s16(vcombine_s16(vqmovn_s32(q2), vqmovn_s32(q3)))));
+    vst1q_s8(q + 16, vcombine_s8(vqmovn_s16(vcombine_s16(vqmovn_s32(q4), vqmovn_s32(q5))),
+                                 vqmovn_s16(vcombine_s16(vqmovn_s32(q6), vqmovn_s32(q7)))));
+    s16[0] = vaddvq_s32(vaddq_s32(vaddq_s32(q0, q1), vaddq_s32(q2, q3)));
+    s16[1] = vaddvq_s32(vaddq_s32(vaddq_s32(q4, q5), vaddq_s32(q6, q7)));
 }
 static inline void xf_act32(const float *x, int I, int8_t *xq, float *dx, int32_t *xs) {
     for (int b = 0; b < I / 32; b++) xf_act32_block(x + b * 32, xq + b * 32, dx + b, xs + 2 * b);
 }
-/* xf16_ref's numbers on a planar row (XF_MODE_A32, for slots a device reads as rows):
- * against one activation row (xf_act32's codes, scales and sums per 16), the unsigned dot
- * of each half on 8 int32 lanes, four blocks' eight sums reduced at once, then xf16_ref's
- * float steps in its order */
 static inline float xf_dot_a32(const uint8_t *w, const float *sc, const int8_t *xq, const float *dx, const int32_t *xs, int I) {
-    const __m256i m4 = _mm256_set1_epi8(0x0F), z = _mm256_setzero_si256();
+    const uint8x16_t m4 = vdupq_n_u8(0x0F);
+    const int32x4_t z = vdupq_n_s32(0);
     const int nb = I / XF_BLOCK;
     float acc = 0.f;
-    for (int b0 = 0; b0 < nb; b0 += 4) {
-        const int nj = nb - b0 < 4 ? nb - b0 : 4;
-        __m256i v[8];
-        for (int j = 0; j < 4; j++) {
-            if (j >= nj) { v[2 * j] = v[2 * j + 1] = z; continue; }
-            const __m256i bb = _mm256_loadu_si256((const __m256i *)(w + (size_t)(b0 + j) * XF_BLOCK_BYTES));
-            const int8_t *xb = xq + (size_t)(b0 + j) * XF_BLOCK;
-            v[2 * j]     = xf_dpbusd(z, _mm256_and_si256(bb, m4), _mm256_loadu_si256((const __m256i *)xb));
-            v[2 * j + 1] = xf_dpbusd(z, _mm256_and_si256(_mm256_srli_epi16(bb, 4), m4), _mm256_loadu_si256((const __m256i *)(xb + 32)));
-        }
-        const __m256i h0 = _mm256_hadd_epi32(_mm256_hadd_epi32(v[0], v[1]), _mm256_hadd_epi32(v[2], v[3]));
-        const __m256i h1 = _mm256_hadd_epi32(_mm256_hadd_epi32(v[4], v[5]), _mm256_hadd_epi32(v[6], v[7]));
-        int32_t p[8];
-        _mm256_storeu_si256((__m256i *)p, _mm256_add_epi32(_mm256_permute2x128_si256(h0, h1, 0x20), _mm256_permute2x128_si256(h0, h1, 0x31)));
-        for (int j = 0; j < nj; j++) {
-            const int b = b0 + j; const int32_t *x16 = xs + 4 * (size_t)b;
-            const int32_t p0 = p[2 * j] - 8 * (x16[0] + x16[1]), p1 = p[2 * j + 1] - 8 * (x16[2] + x16[3]);
-            acc = fmaf(fmaf((float)p1, dx[2 * b + 1], (float)p0 * dx[2 * b]), sc[b], acc);
-        }
+    for (int b = 0; b < nb; b++) {
+        const uint8_t *blk = w + (size_t)b * XF_BLOCK_BYTES;
+        const int8_t *xb = xq + (size_t)b * XF_BLOCK;
+        uint8x16_t b0 = vld1q_u8(blk), b1 = vld1q_u8(blk + 16);
+        int32x4_t v0 = vdotq_s32(z,  vreinterpretq_s8_u8(vandq_u8(b0, m4)), vld1q_s8(xb));
+        v0 = vdotq_s32(v0, vreinterpretq_s8_u8(vandq_u8(b1, m4)), vld1q_s8(xb + 16));
+        int32x4_t v1 = vdotq_s32(z,  vreinterpretq_s8_u8(vshrq_n_u8(b0, 4)), vld1q_s8(xb + 32));
+        v1 = vdotq_s32(v1, vreinterpretq_s8_u8(vshrq_n_u8(b1, 4)), vld1q_s8(xb + 48));
+        const int32_t *x16 = xs + 4 * (size_t)b;
+        const int32_t p0 = vaddvq_s32(v0) - 8 * (x16[0] + x16[1]);
+        const int32_t p1 = vaddvq_s32(v1) - 8 * (x16[2] + x16[3]);
+        acc = fmaf(fmaf((float)p1, dx[2 * b + 1], (float)p0 * dx[2 * b]), sc[b], acc);
     }
     return acc;
 }
-#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
-/* the 16 rows of a group against S <= 8 activation rows: y[s][o .. o + 15] */
-static inline __attribute__((always_inline)) void xf16_body512(float *const *y, int o, const uint8_t *grp, const int8_t *const *xq,
-                                                              const float *const *dx, const int32_t *const *xs, int I, const int S) {
-    const __m512i m4 = _mm512_set1_epi8(15);
-    __m512 acc[8];
-    for (int s = 0; s < S; s++) acc[s] = _mm512_setzero_ps();
-    for (int b = 0; b < I / XF_BLOCK; b++) {
-        const uint8_t *g = grp + (size_t)b * XF16_BLOCK_BYTES;
-        const __m512 sv = _mm512_loadu_ps((const float *)g);
-        __m512i lo[8], hi[8];
-        for (int W = 0; W < 8; W++) {
-            const __m512i v = _mm512_loadu_si512(g + 64 + 64 * W);
-            lo[W] = _mm512_and_si512(v, m4); hi[W] = _mm512_and_si512(_mm512_srli_epi16(v, 4), m4);
-        }
-        for (int s = 0; s < S; s++) {
-            const int8_t *xb = xq[s] + (size_t)b * XF_BLOCK;
-            __m512i p0 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), lo[0], _mm512_set1_epi32(xf16_ld32(xb)));
-            __m512i p1 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), hi[0], _mm512_set1_epi32(xf16_ld32(xb + 32)));
-            for (int W = 1; W < 8; W++) {
-                p0 = _mm512_dpbusd_epi32(p0, lo[W], _mm512_set1_epi32(xf16_ld32(xb + 4 * W)));
-                p1 = _mm512_dpbusd_epi32(p1, hi[W], _mm512_set1_epi32(xf16_ld32(xb + 32 + 4 * W)));
-            }
-            const int32_t *x16 = xs[s] + 4 * (size_t)b; const float *d = dx[s] + 2 * (size_t)b;
-            p0 = _mm512_sub_epi32(p0, _mm512_set1_epi32(8 * (x16[0] + x16[1])));
-            p1 = _mm512_sub_epi32(p1, _mm512_set1_epi32(8 * (x16[2] + x16[3])));
-            const __m512 t = _mm512_fmadd_ps(_mm512_cvtepi32_ps(p1), _mm512_set1_ps(d[1]), _mm512_mul_ps(_mm512_cvtepi32_ps(p0), _mm512_set1_ps(d[0])));
-            acc[s] = _mm512_fmadd_ps(t, sv, acc[s]);
-        }
-    }
-    for (int s = 0; s < S; s++) _mm512_storeu_ps(y[s] + o, acc[s]);
-}
-#define XF16_SMAX 8
-#else
-/* half h (rows 8h .. 8h+7) of a group against S <= 4 activation rows */
-static inline __attribute__((always_inline)) void xf16_body256(float *const *y, int o, const uint8_t *grp, const int8_t *const *xq,
+/* quarter h (rows 4h .. 4h+3) of a group against S <= 4 activation rows */
+static inline __attribute__((always_inline)) void xf16_body128(float *const *y, int o, const uint8_t *grp, const int8_t *const *xq,
                                                               const float *const *dx, const int32_t *const *xs, int I, const int S, const int h) {
-    const __m256i m4 = _mm256_set1_epi8(15);
-    __m256 acc[4];
-    for (int s = 0; s < S; s++) acc[s] = _mm256_setzero_ps();
+    const uint8x16_t m4 = vdupq_n_u8(15);
+    float32x4_t acc[4];
+    for (int s = 0; s < S; s++) acc[s] = vdupq_n_f32(0.f);
     for (int b = 0; b < I / XF_BLOCK; b++) {
         const uint8_t *g = grp + (size_t)b * XF16_BLOCK_BYTES;
-        const __m256 sv = _mm256_loadu_ps((const float *)g + 8 * h);
-        __m256i lo[8], hi[8];
+        const float32x4_t sv = vld1q_f32((const float *)g + 4 * h);
+        int8x16_t lo[8], hi[8];
         for (int W = 0; W < 8; W++) {
-            const __m256i v = _mm256_loadu_si256((const __m256i *)(g + 64 + 64 * W + 32 * h));
-            lo[W] = _mm256_and_si256(v, m4); hi[W] = _mm256_and_si256(_mm256_srli_epi16(v, 4), m4);
+            const uint8x16_t v = vld1q_u8(g + 64 + 64 * W + 16 * h);
+            lo[W] = vreinterpretq_s8_u8(vandq_u8(v, m4));
+            hi[W] = vreinterpretq_s8_u8(vshrq_n_u8(v, 4));
         }
         for (int s = 0; s < S; s++) {
             const int8_t *xb = xq[s] + (size_t)b * XF_BLOCK;
-            __m256i p0 = _mm256_setzero_si256(), p1 = _mm256_setzero_si256();
-#if defined(__AVXVNNI__) || (defined(__AVX512VNNI__) && defined(__AVX512VL__))
+            int32x4_t p0 = vdupq_n_s32(0), p1 = vdupq_n_s32(0);
             for (int W = 0; W < 8; W++) {
-                p0 = xf_dpbusd(p0, lo[W], _mm256_set1_epi32(xf16_ld32(xb + 4 * W)));
-                p1 = xf_dpbusd(p1, hi[W], _mm256_set1_epi32(xf16_ld32(xb + 32 + 4 * W)));
+                p0 = vdotq_s32(p0, lo[W], vreinterpretq_s8_s32(vdupq_n_s32(xf16_ld32(xb + 4 * W))));
+                p1 = vdotq_s32(p1, hi[W], vreinterpretq_s8_s32(vdupq_n_s32(xf16_ld32(xb + 32 + 4 * W))));
             }
-#else   /* codes <= 15: two maddubs add in 16 bits below 2^15 */
-            const __m256i one = _mm256_set1_epi16(1);
-            for (int W = 0; W < 8; W += 2) {
-                p0 = _mm256_add_epi32(p0, _mm256_madd_epi16(_mm256_add_epi16(_mm256_maddubs_epi16(lo[W], _mm256_set1_epi32(xf16_ld32(xb + 4 * W))),
-                         _mm256_maddubs_epi16(lo[W + 1], _mm256_set1_epi32(xf16_ld32(xb + 4 * W + 4)))), one));
-                p1 = _mm256_add_epi32(p1, _mm256_madd_epi16(_mm256_add_epi16(_mm256_maddubs_epi16(hi[W], _mm256_set1_epi32(xf16_ld32(xb + 32 + 4 * W))),
-                         _mm256_maddubs_epi16(hi[W + 1], _mm256_set1_epi32(xf16_ld32(xb + 36 + 4 * W)))), one));
-            }
-#endif
             const int32_t *x16 = xs[s] + 4 * (size_t)b; const float *d = dx[s] + 2 * (size_t)b;
-            p0 = _mm256_sub_epi32(p0, _mm256_set1_epi32(8 * (x16[0] + x16[1])));
-            p1 = _mm256_sub_epi32(p1, _mm256_set1_epi32(8 * (x16[2] + x16[3])));
-            const __m256 t = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p1), _mm256_set1_ps(d[1]), _mm256_mul_ps(_mm256_cvtepi32_ps(p0), _mm256_set1_ps(d[0])));
-            acc[s] = _mm256_fmadd_ps(t, sv, acc[s]);
+            p0 = vsubq_s32(p0, vdupq_n_s32(8 * (x16[0] + x16[1])));
+            p1 = vsubq_s32(p1, vdupq_n_s32(8 * (x16[2] + x16[3])));
+            const float32x4_t t = vfmaq_f32(vmulq_f32(vcvtq_f32_s32(p0), vdupq_n_f32(d[0])),
+                                            vcvtq_f32_s32(p1), vdupq_n_f32(d[1]));
+            acc[s] = vfmaq_f32(acc[s], t, sv);
         }
     }
-    for (int s = 0; s < S; s++) _mm256_storeu_ps(y[s] + o + 8 * h, acc[s]);
+    for (int s = 0; s < S; s++) vst1q_f32(y[s] + o + 4 * h, acc[s]);
 }
 #define XF16_SMAX 4
-#endif
-/* the group grp (rows o .. o + 15 of its matrix) against S activation rows: y[s][o ..],
- * xq[s] / dx[s] / xs[s] each row's codes, scales per 32 and sums per 16 (xf_act32) */
 static void xf16_rows(float *const *y, int o, const uint8_t *grp, const int8_t *const *xq, const float *const *dx,
                       const int32_t *const *xs, int I, int S) {
     for (int s0 = 0; s0 < S; s0 += XF16_SMAX) {
         const int n = S - s0 < XF16_SMAX ? S - s0 : XF16_SMAX;
-#if XF16_SMAX == 8
-#define XF16_CALL(N) xf16_body512(y + s0, o, grp, xq + s0, dx + s0, xs + s0, I, N)
-#else
-#define XF16_CALL(N) do { xf16_body256(y + s0, o, grp, xq + s0, dx + s0, xs + s0, I, N, 0); xf16_body256(y + s0, o, grp, xq + s0, dx + s0, xs + s0, I, N, 1); } while (0)
-#endif
+#define XF16_CALL(N) do { \
+    xf16_body128(y + s0, o, grp, xq + s0, dx + s0, xs + s0, I, N, 0); \
+    xf16_body128(y + s0, o, grp, xq + s0, dx + s0, xs + s0, I, N, 1); \
+    xf16_body128(y + s0, o, grp, xq + s0, dx + s0, xs + s0, I, N, 2); \
+    xf16_body128(y + s0, o, grp, xq + s0, dx + s0, xs + s0, I, N, 3); \
+} while (0)
         switch (n) { case 1: XF16_CALL(1); break; case 2: XF16_CALL(2); break; case 3: XF16_CALL(3); break;
                      case 4: XF16_CALL(4); break; default: XF16_CALL(n); break; }
 #undef XF16_CALL
     }
 }
-#endif /* AVX2 */
+#endif /* XF16_ON */
 
 /* ---- one expert ------------------------------------------------------------- */
 

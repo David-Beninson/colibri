@@ -1,24 +1,21 @@
-"""CLI entry point for the Colibri Qwen3.6-35B-A3B Desktop Holographic AI Companion (`src/ai/cli.py`).
+"""CLI entry point for the Colibri Qwen3.6-35B-A3B AI Companion (`src/ai/cli.py`).
 
 Supports:
 - Single-query research & companion mode:
     python3 -m src.ai.cli "What are the latest breakthroughs in..."
-- Interactive multi-turn chat & holographic companion mode:
+- Interactive multi-turn chat & companion mode:
     python3 -m src.ai.cli
   with slash commands:
-    /tools                             List all bound internet, vision, voice, memory, code & device tools
+    /tools                             List all bound internet, vision, voice, memory & code tools
     /slot N                            Switch Colibri KV cache_slot (0..15)
     /think on|off                      Toggle Qwen3.6 reasoning mode
     /decide <question> | <opt1> | ...  Closed-set System One probability decision
-    /avatar [state] [emotion]          Show or set Pepper's Ghost 3D avatar state
-    /rotate <angle>                    Rotate holographic cylinder servo (-180..180 deg)
-    /birthday                          Trigger Birthday celebration hologram, confetti & bilingual greeting
     /memory [query]                    List saved personal facts or search `data/memory_db/`
     /voice <audio_path>                Transcribe spoken Hebrew/English audio via Whisper
     /speak <text>                      Synthesize speech via Edge-TTS (`he-IL-HilaNeural` / English)
     /ocr <image_path>                  Extract Hebrew/English text from an image via Tesseract OCR
     /clear                             Clear conversation history
-    /status                            Show active runner, model, context window, KV slot & hardware state
+    /status                            Show active runner, model, context window, KV slot & tool state
 - Gateway & tool pre-flight check:
     python3 -m src.ai.cli --check
 """
@@ -33,13 +30,7 @@ from typing import Any, Dict, List, Optional
 
 from .config import MLX_BASE_URL, OLLAMA_BASE_URL, AgentConfig, detect_best_local_backend
 from .graph import _load_tools_registry, has_langgraph, run_agent
-from .persona import BIRTHDAY_GREETING_EN, BIRTHDAY_GREETING_HE, COMPANION_NAME
-from .tools.device import (
-    get_device_state,
-    rotate_device,
-    set_avatar_state,
-    trigger_hologram_effect,
-)
+from .persona import COMPANION_NAME
 
 
 def _runner_label(force_stdlib: bool = False) -> str:
@@ -52,11 +43,10 @@ def _print_banner(config: AgentConfig, force_stdlib: bool = False, stream: Any =
     out = stream or sys.stderr
     runner = _runner_label(force_stdlib=force_stdlib)
     think_str = "on" if config.enable_thinking else "off"
-    dev = get_device_state()
     print(
         f"[colibri-agent] Companion: {COMPANION_NAME} | Runner: {runner} | Model: {config.model} "
         f"| Context: {config.context_length} tokens | Slot: {config.cache_slot} "
-        f"| Thinking: {think_str} | Avatar: {dev.get('avatar_state', 'idle')} ({dev.get('servo_angle', 0)}°)",
+        f"| Thinking: {think_str}",
         file=out,
     )
 
@@ -169,9 +159,8 @@ def _list_tools_text() -> str:
 def _format_status(config: AgentConfig, history: List[Dict[str, Any]], force_stdlib: bool) -> str:
     registry, schemas, _ = _load_tools_registry(fast_mode=getattr(config, "fast_tool_pruning", False))
     tool_count = len(schemas) or len(registry)
-    dev = get_device_state()
     return (
-        f"Colibri Holographic Companion Status ({COMPANION_NAME}):\n"
+        f"Colibri Companion Status ({COMPANION_NAME}):\n"
         f"  Runner            : {_runner_label(force_stdlib=force_stdlib)}\n"
         f"  Gateway Base URL  : {config.base_url}\n"
         f"  Model             : {config.model}\n"
@@ -186,9 +175,6 @@ def _format_status(config: AgentConfig, history: List[Dict[str, Any]], force_std
         f"  Max Tool Chars    : {config.max_tool_chars}\n"
         f"  Max Step Budget   : {config.max_iterations}\n"
         f"  Bound Tools       : {tool_count}\n"
-        f"  Avatar State      : {dev.get('avatar_state', 'idle')} (emotion={dev.get('emotion', 'warm')})\n"
-        f"  Hologram Effect   : {dev.get('hologram_effect', 'ambient_pulse')} (LED={dev.get('led_rgb', '255,180,220')})\n"
-        f"  Servo Angle       : {dev.get('servo_angle', 0)}°\n"
         f"  History Messages  : {len(history)}"
     )
 
@@ -197,7 +183,7 @@ def _interactive_loop(config: AgentConfig, force_stdlib: bool = False) -> int:
     _print_banner(config, force_stdlib=force_stdlib, stream=sys.stdout)
     print(
         "Type a message or command (/tools, /slot N, /think on|off, /decide, "
-        "/avatar, /rotate <deg>, /birthday, /memory, /voice <path>, /speak <text>, /ocr <path>, /clear, /status, /quit).",
+        "/memory, /voice <path>, /speak <text>, /ocr <path>, /clear, /status, /quit).",
         flush=True,
     )
     history: List[Dict[str, Any]] = []
@@ -222,15 +208,12 @@ def _interactive_loop(config: AgentConfig, force_stdlib: bool = False) -> int:
                 "  /slot N                            Switch Colibri KV cache slot (0..15)\n"
                 "  /think on|off                      Toggle Qwen3.6 thinking mode\n"
                 "  /decide <question> | <opt1> | ...  Run System One closed-set decision\n"
-                "  /avatar [state] [emotion]          Inspect or set 3D hologram avatar state\n"
-                "  /rotate <angle>                    Rotate cylinder servo (-180..180 degrees)\n"
-                "  /birthday                          Trigger Birthday celebration mode & greeting\n"
                 "  /memory [query]                    List saved facts or query local memory\n"
                 "  /voice <audio_path>                Transcribe audio file via Whisper\n"
                 "  /speak <text>                      Synthesize speech via Edge-TTS\n"
                 "  /ocr <image_path>                  Extract text from image via Tesseract OCR\n"
                 "  /clear                             Reset conversation history\n"
-                "  /status                            Show runner, model, context & hardware status\n"
+                "  /status                            Show runner, model, context & tool status\n"
                 "  /quit                              Exit interactive session"
             )
             continue
@@ -275,33 +258,6 @@ def _interactive_loop(config: AgentConfig, force_stdlib: bool = False) -> int:
         if line.startswith("/decide"):
             arg = line[len("/decide") :].strip()
             print(_run_decide_command(arg, config))
-            continue
-
-        if line.startswith("/avatar"):
-            arg = line[len("/avatar") :].strip()
-            if not arg:
-                print(json.dumps(get_device_state(), indent=2, ensure_ascii=False))
-            else:
-                parts = arg.split(maxsplit=2)
-                st = parts[0]
-                em = parts[1] if len(parts) > 1 else "warm"
-                sub = parts[2] if len(parts) > 2 else ""
-                print(set_avatar_state(state=st, emotion=em, subtitle=sub))
-            continue
-
-        if line.startswith("/rotate"):
-            arg = line[len("/rotate") :].strip()
-            try:
-                angle = int(round(float(arg)))
-                print(rotate_device(angle))
-            except ValueError:
-                print("Usage: /rotate <angle_in_degrees> (e.g. /rotate -30 or /rotate 45)")
-            continue
-
-        if line == "/birthday":
-            set_avatar_state(state="birthday", emotion="joyful", subtitle="יום הולדת שמח! 🎂")
-            trigger_hologram_effect(effect="birthday_confetti", led_rgb="255,140,200")
-            print(f"\n🎂 {BIRTHDAY_GREETING_HE}\n\n✨ {BIRTHDAY_GREETING_EN}")
             continue
 
         if line.startswith("/memory"):
@@ -351,7 +307,7 @@ def _interactive_loop(config: AgentConfig, force_stdlib: bool = False) -> int:
                 config.enable_thinking = False
                 config.max_tokens = 256
                 print(
-                    "[colibri-agent] Fast Companion Mode enabled (9 core tools on slot 0, enable_thinking=False, max_tokens=256)."
+                    "[colibri-agent] Fast Companion Mode enabled (6 core tools on slot 0, enable_thinking=False, max_tokens=256)."
                 )
             elif arg in ("off", "false", "0"):
                 config.fast_tool_pruning = False
@@ -396,7 +352,7 @@ def _interactive_loop(config: AgentConfig, force_stdlib: bool = False) -> int:
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="coli-agent",
-        description="Colibri Qwen3.6-35B-A3B Desktop Holographic AI Companion & Research Agent CLI",
+        description="Colibri Qwen3.6-35B-A3B AI Companion & Research Agent CLI",
     )
     parser.add_argument(
         "query",
@@ -447,14 +403,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="Run configuration and tool pre-flight check and exit",
     )
     parser.add_argument(
-        "--birthday",
-        action="store_true",
-        help="Trigger Birthday celebration mode on the 3D hologram and print bilingual greetings",
-    )
-    parser.add_argument(
         "--fast",
         action="store_true",
-        help="Enable Fast Companion Mode (9 core tools on slot 0, thinking off, max_tokens=256)",
+        help="Enable Fast Companion Mode (core tools on slot 0, thinking off, max_tokens=256)",
     )
     parser.add_argument(
         "--stream-tts",
@@ -520,12 +471,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(_list_tools_text())
         return 0
 
-    if args.birthday:
-        set_avatar_state(state="birthday", emotion="joyful", subtitle="יום הולדת שמח! 🎂")
-        trigger_hologram_effect(effect="birthday_confetti", led_rgb="255,140,200")
-        print(f"🎂 {BIRTHDAY_GREETING_HE}\n\n✨ {BIRTHDAY_GREETING_EN}")
-        return 0
-
     query_str = " ".join(args.query).strip()
     if not query_str:
         return _interactive_loop(config, force_stdlib=args.stdlib)
@@ -555,7 +500,6 @@ def main(argv: Optional[List[str]] = None) -> int:
                     "model": result.model,
                     "steps": result.steps,
                     "tool_calls": result.tool_calls,
-                    "device_state": get_device_state(),
                 },
                 indent=2,
                 ensure_ascii=False,

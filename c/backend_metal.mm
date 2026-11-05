@@ -831,7 +831,6 @@ static id<MTLComputePipelineState> g_t_tmul, g_t_xwt, g_t_xw, g_t_outer;   /* tr
 static size_t g_tensor_count, g_tensor_bytes;
 static uint64_t g_moe_ok, g_moe_fb, g_moe_experts;   // GPU blocks / CPU-fallback blocks / experts on GPU
 static double g_t_setup, g_t_gpu, g_t_scatter, g_t_kernel;       // per-block time breakdown (seconds)
-static const int TG = 128;
 static MTLResourceOptions g_res_opts = MTLResourceStorageModeShared;   // COLI_METAL_UNTRACKED=1 adds HazardTrackingModeUntracked
 #include <mach/mach_time.h>
 static double mnow(){ static mach_timebase_info_data_t tb; if(tb.denom==0) mach_timebase_info(&tb);
@@ -2153,12 +2152,25 @@ extern "C" int coli_metal_moe_block_end(ColiMetalMoeHandle *h, float *out) {
  floating-point data survives for GPU reads, then uses `blitSynchronizeResource` +
  `blitFromResource:toBuffer` to push back the GPU result into caller's ptr.  */
 
-// Push initial bytes from a CPU pointer into a Managed buffer and return the buffer.
-static id<MTLBuffer> cpubuf(id<MTLDevice> dev, const void *cpu, size_t len) {
-  id<MTLBuffer> b = [dev newBufferWithLength:len options:MTLResourceStorageModeManaged];
+// Zero-copy wrap for page-aligned host memory; shared copy fallback if unaligned.
+#ifndef Q36_PAGE
+#define Q36_PAGE 16384
+#endif
+
+static id<MTLBuffer> zerobuf(id<MTLDevice> dev, const void *cpu, size_t len) {
+  if (!dev || !cpu || len == 0) return nil;
+  if (((uintptr_t)cpu % Q36_PAGE) == 0) {
+    size_t aligned_len = (len + Q36_PAGE - 1) / Q36_PAGE * Q36_PAGE;
+    if (aligned_len == 0) aligned_len = Q36_PAGE;
+    id<MTLBuffer> b = [dev newBufferWithBytesNoCopy:(void*)cpu
+                                             length:aligned_len
+                                            options:MTLResourceStorageModeShared
+                                        deallocator:nil];
+    if (b) return b;
+  }
+  id<MTLBuffer> b = [dev newBufferWithLength:len options:MTLResourceStorageModeShared];
   if (!b) return nil;
   memcpy(b.contents, cpu, len);
-  [b didModifyRange:NSMakeRange(0, (NSUInteger)len)];
   return b;
 }
 
@@ -2166,8 +2178,10 @@ extern "C" int coli_metal_rmsnorm(float *x, const float *w, int nrows, int D, fl
   if (!g_dev) return 0;
   @autoreleasepool {
     id<MTLCommandBuffer> cb = [g_queue commandBuffer];
-    id<MTLBuffer> xb = cpubuf(g_dev, x, (size_t)nrows*D*4);
-    id<MTLBuffer> wb = cpubuf(g_dev, w, (size_t)D*4);
+    size_t x_bytes = (size_t)nrows * D * 4;
+    size_t w_bytes = (size_t)D * 4;
+    id<MTLBuffer> xb = zerobuf(g_dev, x, x_bytes);
+    id<MTLBuffer> wb = zerobuf(g_dev, w, w_bytes);
     if (!xb || !wb) return 0;
     id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
     int tgsz = 256;
@@ -2176,10 +2190,10 @@ extern "C" int coli_metal_rmsnorm(float *x, const float *w, int nrows, int D, fl
     [e setBytes:&D length:4 atIndex:2]; [e setBytes:&eps length:4 atIndex:3];
     [e dispatchThreadgroups:MTLSizeMake(nrows,1,1) threadsPerThreadgroup:MTLSizeMake(tgsz,1,1)];
     [e endEncoding];
-    { id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder]; [bl synchronizeResource:xb]; [bl endEncoding]; }
     [cb commit]; [cb waitUntilCompleted];
-    memcpy(x, xb.contents, (size_t)nrows * D * 4);
-    return cb.status != MTLCommandBufferStatusError;
+    if (cb.status == MTLCommandBufferStatusError) return 0;
+    if (xb.contents != x) memcpy(x, xb.contents, x_bytes);
+    return 1;
   }
 }
 
@@ -2187,8 +2201,9 @@ extern "C" int coli_metal_add(float *y, const float *a, size_t n) {
   if (!g_dev || n == 0) return n == 0 ? 1 : 0;
   @autoreleasepool {
     id<MTLCommandBuffer> cb = [g_queue commandBuffer];
-    id<MTLBuffer> yb = cpubuf(g_dev, y, n*4);
-    id<MTLBuffer> ab = cpubuf(g_dev, a, n*4);
+    size_t bytes = n * 4;
+    id<MTLBuffer> yb = zerobuf(g_dev, y, bytes);
+    id<MTLBuffer> ab = zerobuf(g_dev, a, bytes);
     if (!yb || !ab) return 0;
     id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
     int tgsz = 256;
@@ -2196,10 +2211,10 @@ extern "C" int coli_metal_add(float *y, const float *a, size_t n) {
     [e setBuffer:yb offset:0 atIndex:0]; [e setBuffer:ab offset:0 atIndex:1];
     [e dispatchThreads:MTLSizeMake((uint32_t)n,1,1) threadsPerThreadgroup:MTLSizeMake(tgsz,1,1)];
     [e endEncoding];
-    { id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder]; [bl synchronizeResource:yb]; [bl endEncoding]; }
     [cb commit]; [cb waitUntilCompleted];
-    memcpy(y, yb.contents, n*4);
-    return cb.status != MTLCommandBufferStatusError;
+    if (cb.status == MTLCommandBufferStatusError) return 0;
+    if (yb.contents != y) memcpy(y, yb.contents, bytes);
+    return 1;
   }
 }
 
@@ -2207,8 +2222,9 @@ extern "C" int coli_metal_silu_mul_clamped(float *g, const float *u, size_t n, f
   if (!g_dev || n == 0 || !(limit > 0.0f)) return n == 0 ? 1 : 0;
   @autoreleasepool {
     id<MTLCommandBuffer> cb = [g_queue commandBuffer];
-    id<MTLBuffer> gb = cpubuf(g_dev, g, n*4);
-    id<MTLBuffer> ub = cpubuf(g_dev, u, n*4);
+    size_t bytes = n * 4;
+    id<MTLBuffer> gb = zerobuf(g_dev, g, bytes);
+    id<MTLBuffer> ub = zerobuf(g_dev, u, bytes);
     if (!gb || !ub) return 0;
     id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
     [e setComputePipelineState:g_moe_silu_clamped];
@@ -2216,10 +2232,9 @@ extern "C" int coli_metal_silu_mul_clamped(float *g, const float *u, size_t n, f
     [e setBytes:&limit length:sizeof(float) atIndex:2];
     [e dispatchThreads:MTLSizeMake((uint32_t)n,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
     [e endEncoding];
-    { id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder]; [bl synchronizeResource:gb]; [bl endEncoding]; }
     [cb commit]; [cb waitUntilCompleted];
     if (cb.status == MTLCommandBufferStatusError) return 0;
-    memcpy(g, gb.contents, n*4);
+    if (gb.contents != g) memcpy(g, gb.contents, bytes);
     return 1;
   }
 }
@@ -2228,8 +2243,9 @@ extern "C" int coli_metal_silu_mul(float *g, const float *u, size_t n) {
   if (!g_dev || n == 0) return n == 0 ? 1 : 0;
   @autoreleasepool {
     id<MTLCommandBuffer> cb = [g_queue commandBuffer];
-    id<MTLBuffer> gb = cpubuf(g_dev, g, n*4);
-    id<MTLBuffer> ub = cpubuf(g_dev, u, n*4);
+    size_t bytes = n * 4;
+    id<MTLBuffer> gb = zerobuf(g_dev, g, bytes);
+    id<MTLBuffer> ub = zerobuf(g_dev, u, bytes);
     if (!gb || !ub) return 0;
     id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
     int tgsz = 256;
@@ -2237,10 +2253,10 @@ extern "C" int coli_metal_silu_mul(float *g, const float *u, size_t n) {
     [e setBuffer:gb offset:0 atIndex:0]; [e setBuffer:ub offset:0 atIndex:1];
     [e dispatchThreads:MTLSizeMake((uint32_t)n,1,1) threadsPerThreadgroup:MTLSizeMake(tgsz,1,1)];
     [e endEncoding];
-    { id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder]; [bl synchronizeResource:gb]; [bl endEncoding]; }
     [cb commit]; [cb waitUntilCompleted];
-    memcpy(g, gb.contents, n*4);
-    return cb.status != MTLCommandBufferStatusError;
+    if (cb.status == MTLCommandBufferStatusError) return 0;
+    if (gb.contents != g) memcpy(g, gb.contents, bytes);
+    return 1;
   }
 }
 

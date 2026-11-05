@@ -1,7 +1,7 @@
 """Rich internet and utility tool suite for Colibri AI Agents (`src/ai/tools/internet.py`).
 
-Reuses ``ui.web`` (`search`, `page`, `_public_url`) when available, with a
-standalone SSRF-safe fallback. Every tool is decorated for LangChain/LangGraph
+Uses a standalone SSRF-safe implementation (`ddgs`, SearXNG, `trafilatura`, and
+stdlib HTML parser). Every tool is decorated for LangChain/LangGraph
 compatibility (with a zero-dependency fallback when ``langchain_core`` is not
 installed) and exported alongside ``OPENAI_TOOLS_SCHEMA`` and ``TOOL_REGISTRY``.
 """
@@ -16,23 +16,12 @@ import operator
 import os
 import re
 import socket
-import sys
 import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from html.parser import HTMLParser
 from typing import Any, Callable, Dict, List, Optional, Tuple
-
-# Ensure repo root is importable so `ui.web` can be reused seamlessly
-_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
-
-try:
-    from ui import web as _ui_web  # type: ignore
-except Exception:  # noqa: BLE001
-    _ui_web = None  # type: ignore
 
 try:
     from langchain_core.tools import tool as _lc_tool  # type: ignore
@@ -87,9 +76,6 @@ _PUBLIC_HOST_CACHE: Dict[Tuple[str, int], bool] = {}
 
 def _public_url(url: str) -> str:
     """Verify that ``url`` uses http/https and resolves strictly to global public IP addresses."""
-    if _ui_web is not None and hasattr(_ui_web, "_public_url"):
-        return _ui_web._public_url(url)
-
     u = urllib.parse.urlsplit(url)
     if u.scheme not in ("http", "https") or not u.hostname:
         raise ValueError("http and https links only")
@@ -143,7 +129,7 @@ def _open_public(
 
 
 class _LinkAndTextExtractor(HTMLParser):
-    """Extract outbound links and readable text from HTML when `ui.web` is supplemented."""
+    """Extract outbound links and readable text from HTML."""
 
     SKIP = {
         "script",
@@ -274,14 +260,10 @@ def web_search(query: str, max_results: int = 5) -> str:
                 {"q": query, "results": results, "answers": []},
                 ensure_ascii=False,
             )
-    except Exception:  # noqa: BLE001 - fall back to ui.web / SearXNG / DDG HTML
+    except Exception:  # noqa: BLE001 - fall back to SearXNG / DDG HTML
         pass
 
     try:
-        if _ui_web is not None:
-            res = _ui_web.search(query, n)
-            return json.dumps(res, ensure_ascii=False)
-        # Fallback if ui.web is unavailable
         body = urllib.parse.urlencode({"q": query}).encode("utf-8")
         req = urllib.request.Request(
             "https://html.duckduckgo.com/html/",
@@ -315,25 +297,22 @@ def fetch_webpage(url: str, max_chars: int = 4500, include_links: bool = True) -
         return json.dumps({"error": "Empty URL"})
     max_chars = max(300, min(int(max_chars), 15000))
     try:
-        if _ui_web is not None:
-            page_data = _ui_web.page(url, max_chars=max_chars)
-        else:
-            raw, ctype, final_url = _open_public(
-                url, accept="text/html,text/plain;q=0.9", timeout=10.0
-            )
-            charset = re.search(r"charset=([\w-]+)", ctype, re.I)
-            decoded = raw.decode(charset.group(1) if charset else "utf-8", errors="replace")
-            parser = _LinkAndTextExtractor(final_url)
-            parser.feed(decoded)
-            text = re.sub(r"[ \t\r\f\v]+", " ", "".join(parser.text_parts))
-            text = re.sub(r"\s*\n\s*", "\n", text).strip()
-            page_data = {
-                "url": final_url,
-                "title": parser.title.strip()[:200],
-                "text": text[:max_chars],
-                "truncated": len(text) > max_chars,
-                "chars": len(text),
-            }
+        raw, ctype, final_url = _open_public(
+            url, accept="text/html,text/plain;q=0.9", timeout=10.0
+        )
+        charset = re.search(r"charset=([\w-]+)", ctype, re.I)
+        decoded = raw.decode(charset.group(1) if charset else "utf-8", errors="replace")
+        parser = _LinkAndTextExtractor(final_url)
+        parser.feed(decoded)
+        text = re.sub(r"[ \t\r\f\v]+", " ", "".join(parser.text_parts))
+        text = re.sub(r"\s*\n\s*", "\n", text).strip()
+        page_data = {
+            "url": final_url,
+            "title": parser.title.strip()[:200],
+            "text": text[:max_chars],
+            "truncated": len(text) > max_chars,
+            "chars": len(text),
+        }
 
         if include_links:
             page_data["links"] = _extract_links_from_html(page_data.get("url", url), max_links=10)

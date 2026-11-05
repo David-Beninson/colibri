@@ -1,11 +1,9 @@
-"""Perception and Vision tool suite for the Desktop Holographic AI Companion (`src/ai/tools/vision.py`).
+"""Perception and Vision tool suite for the Colibri Companion (`src/ai/tools/vision.py`).
 
 Provides:
 - ``extract_text_from_image``: Multilingual OCR (`heb+eng` with fallback to `eng`) via `pytesseract` & `PIL`.
 - ``describe_image_scene``: Scene understanding with cascading vision providers (Google Gemini Flash ->
   OpenRouter free vision -> local Colibri vision endpoint -> local PIL + OCR metadata fallback).
-- ``detect_person_angle``: OpenCV Haar cascade face detection mapped to a target servo pan angle (`-60°` to `+60°`)
-  so the holographic cylinder can physically rotate toward the user.
 """
 from __future__ import annotations
 
@@ -268,80 +266,14 @@ def describe_image_scene(
     )
 
 
-_CASCADE_CACHE: Dict[str, Any] = {}
-
-
-@_tool_decorator
-def detect_person_angle(image_path: str) -> str:
-    """Detect the primary person/face in a camera frame and return the target servo pan angle (-60 to +60 degrees) so the holographic cylinder can rotate toward her."""
-    path = os.path.expanduser((image_path or "").strip())
-    if not path or not os.path.isfile(path):
-        return json.dumps({"error": f"Image file not found: {image_path}"})
-
-    try:
-        import cv2  # type: ignore
-
-        img = cv2.imread(path)
-        if img is None:
-            return json.dumps({"image_path": path, "error": "OpenCV could not decode image"})
-        height, width = img.shape[:2]
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        cascade_path = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
-        if cascade_path not in _CASCADE_CACHE:
-            _CASCADE_CACHE[cascade_path] = cv2.CascadeClassifier(cascade_path)
-        detector = _CASCADE_CACHE[cascade_path]
-        faces = detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
-
-        if len(faces) == 0:
-            return json.dumps(
-                {
-                    "image_path": path,
-                    "person_detected": False,
-                    "recommended_pan_angle": 0,
-                    "message": "No face detected in frame; keeping neutral 0° pan angle.",
-                }
-            )
-
-        # Pick largest bounding box as primary user
-        primary = max(faces, key=lambda b: int(b[2]) * int(b[3]))
-        x, y, w, h = [int(v) for v in primary]
-        center_x = x + w / 2.0
-        # Map horizontal normalized offset [-0.5, +0.5] across a 120° FOV camera to [-60, +60] deg
-        norm_offset = (center_x / float(max(width, 1))) - 0.5
-        pan_angle = int(round(max(-60.0, min(60.0, norm_offset * 120.0))))
-
-        return json.dumps(
-            {
-                "image_path": path,
-                "person_detected": True,
-                "face_bbox": {"x": x, "y": y, "width": w, "height": h},
-                "frame_size": {"width": width, "height": height},
-                "recommended_pan_angle": pan_angle,
-            }
-        )
-    except Exception as exc:  # noqa: BLE001
-        width, height, _ = _read_image_dimensions(path)
-        return json.dumps(
-            {
-                "image_path": path,
-                "person_detected": False,
-                "recommended_pan_angle": 0,
-                "frame_size": {"width": width, "height": height},
-                "note": f"OpenCV face tracking unavailable ({type(exc).__name__}: {exc}); defaulting to 0°.",
-            }
-        )
-
-
 VISION_TOOLS: List[Any] = [
     extract_text_from_image,
     describe_image_scene,
-    detect_person_angle,
 ]
 
 VISION_TOOL_REGISTRY: Dict[str, Callable[..., str]] = {
     "extract_text_from_image": extract_text_from_image,
     "describe_image_scene": describe_image_scene,
-    "detect_person_angle": detect_person_angle,
 }
 
 VISION_TOOLS_SCHEMA: List[Dict[str, Any]] = [
@@ -383,18 +315,13 @@ VISION_TOOLS_SCHEMA: List[Dict[str, Any]] = [
             },
         },
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "detect_person_angle",
-            "description": "Detect the primary person's face in a camera frame and compute the target servo pan angle (-60 to +60 degrees) to rotate the holographic companion toward her.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "image_path": {"type": "string", "description": "Local file path to the camera frame."},
-                },
-                "required": ["image_path"],
-            },
-        },
-    },
 ]
+
+__all__ = [
+    "VISION_TOOLS",
+    "VISION_TOOL_REGISTRY",
+    "VISION_TOOLS_SCHEMA",
+    "extract_text_from_image",
+    "describe_image_scene",
+]
+

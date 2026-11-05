@@ -163,7 +163,7 @@ class AgentConfig:
         default_factory=lambda: os.environ.get("COLIBRI_COMPACT", "auto")
     )
     max_tool_chars: int = field(
-        default_factory=lambda: _env_int("COLIBRI_MAX_TOOL_CHARS", 2500)
+        default_factory=lambda: _env_int("COLIBRI_MAX_TOOL_CHARS", 4000)
     )
     max_iterations: int = field(
         default_factory=lambda: _env_int("COLIBRI_MAX_ITERATIONS", 3)

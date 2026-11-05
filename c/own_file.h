@@ -14,8 +14,8 @@
  * "wb", "w", "w+b". A refused name fails like a failed fopen (NULL, errno set:
  * ELOOP for a link, EINVAL for anything else that is not a regular file).
  *
- * coli_own_is_link() says whether a path's last component is a symlink (or, on
- * Windows, any reparse point), for directories the engine creates and writes in.
+ * coli_own_is_link() says whether a path's last component is a symlink,
+ * for directories the engine creates and writes in.
  *
  * coli_own_fopen_tmp() and coli_own_replace() write a state file as a whole: the
  * first opens "<path>.tmp" for writing, the second renames it over <path> once
@@ -24,44 +24,18 @@
  * name is removed and the open is tried once more.
  *
  * coli_own_same_path() says whether two paths are one file, also for a file that
- * does not exist yet.
- *
- * Windows has no O_NOFOLLOW: there the name is checked for a reparse point just
- * before the open. Creating a symlink there needs a privilege or developer
- * mode, and archive tools leave them out unless asked. */
+ * does not exist yet. */
 #ifndef OWN_FILE_H
 #define OWN_FILE_H
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "compat.h"      /* rename() replaces an existing file on Windows */
-
-#ifdef _WIN32
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-
-static inline int coli_own_is_link(const char *path){
-    DWORD a = GetFileAttributesA(path);
-    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_REPARSE_POINT);
-}
-
-static inline FILE *coli_own_fopen(const char *path, const char *mode){
-    if(mode[0] != 'r' && mode[0] != 'w'){ errno = EINVAL; return NULL; }   /* the modes the POSIX side takes */
-    DWORD a = GetFileAttributesA(path);
-    if(a != INVALID_FILE_ATTRIBUTES){
-        if(a & FILE_ATTRIBUTE_REPARSE_POINT){ errno = ELOOP; return NULL; }
-        if(a & FILE_ATTRIBUTE_DIRECTORY){ errno = EINVAL; return NULL; }
-    }
-    return fopen(path, mode);
-}
-#else
-#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "compat.h"
 
 static inline int coli_own_is_link(const char *path){
     struct stat st;
@@ -89,14 +63,10 @@ static inline FILE *coli_own_fopen(const char *path, const char *mode){
     if(!f){ int e = errno; close(fd); errno = e; }
     return f;
 }
-#endif
 
 /* The absolute path of `path` with links resolved, in allocated memory. A file that does not
  * exist yet is resolved through its directory. NULL when that fails too. */
 static inline char *coli_own_resolve(const char *path){
-#ifdef _WIN32
-    return _fullpath(NULL, path, 0);
-#else
     char *full = realpath(path, NULL);
     if(full || errno != ENOENT) return full;
     const char *slash = strrchr(path, '/'), *name = slash ? slash + 1 : path;
@@ -108,7 +78,6 @@ static inline char *coli_own_resolve(const char *path){
     if(joined) sprintf(joined, "%s/%s", real, name);
     free(real);
     return joined;
-#endif
 }
 
 /* 1 when both paths are one file. Paths that cannot be resolved are compared as written. */

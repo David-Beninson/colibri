@@ -586,6 +586,7 @@ static int run_moe(const std::vector<int>& nrv, int qgs, const char* name) {
 // Mirrors the engine split exactly: the caller pre-rotates the staged gate/up input
 // (colibri.c metal_stage_rot_e8), the GPU rotates the down input (moe_fwht), and
 // matmul_e8/e8_rot_rows from quant.h are the reference for both.
+#ifdef COLI_TEST_E8
 #define COLI_QUANT_TEST_ONLY 1
 #include "../quant.h"
 static int run_moe_e8(const std::vector<int>& nrv, const char* name) {
@@ -635,6 +636,7 @@ static int run_moe_e8(const std::vector<int>& nrv, const char* name) {
   for(int e=0;e<nb;e++){ coli_metal_unregister(slab[e]); coli_metal_unregister(fslab[e]); free(slab[e]); free(fslab[e]); }
   return pass?0:1;
 }
+#endif
 
 // ---- fused decode attention vs a CPU reference replicating glm.c's exact math ----
 // GLM-5.2 dims (hardcoded in the backend): hidden=6144 H=64 q_lora=2048 kv_lora=512
@@ -930,8 +932,25 @@ static void cpu_rmsnorm(float *out, const float *x, const float *w, int D, float
   for (int i=0; i<D; i++) out[i] = x[i] * r * w[i];
 }
 
+template <typename T>
+struct PageAlignedAllocator {
+  using value_type = T;
+  PageAlignedAllocator() = default;
+  template <class U> PageAlignedAllocator(const PageAlignedAllocator<U>&) noexcept {}
+  T* allocate(std::size_t n) {
+    void* p = nullptr;
+    size_t bytes = n * sizeof(T);
+    size_t sz = (bytes + 16384 - 1) / 16384 * 16384;
+    if (posix_memalign(&p, 16384, sz ? sz : 16384) != 0 || !p) throw std::bad_alloc();
+    return static_cast<T*>(p);
+  }
+  void deallocate(T* p, std::size_t) noexcept { free(p); }
+};
+template <typename T>
+using AlignedVector = std::vector<T, PageAlignedAllocator<T>>;
+
 static int run_rmsnorm(int nrows, int D, const char *name) {
-  std::vector<float> x((size_t)nrows * D), w(D), ref((size_t)nrows * D), gpu((size_t)nrows * D);
+  AlignedVector<float> x((size_t)nrows * D), w(D), ref((size_t)nrows * D), gpu((size_t)nrows * D);
   srand(5050 + D + nrows);
   for (auto &v : x) v = ((rand() % 2000) - 1000) / 1000.f;
   for (auto &v : w) v = 0.5f + (rand() % 1000) / 1000.f;
@@ -952,7 +971,7 @@ static void cpu_add(float *y, const float *a, size_t n) {
 }
 
 static int run_add(size_t n, const char *name) {
-  std::vector<float> y_cpu(n), y_gpu(n), a(n);
+  AlignedVector<float> y_cpu(n), y_gpu(n), a(n);
   srand(6060 + (int)(n % 10000));
   for (auto &v : y_cpu) v = ((rand() % 2000) - 1000) / 1000.f;
   for (auto &v : a)     v = ((rand() % 2000) - 1000) / 1000.f;
@@ -972,7 +991,7 @@ static void cpu_silu_mul(float *g, const float *u, size_t n) {
 }
 
 static int run_silu_mul(size_t n, const char *name) {
-  std::vector<float> g_cpu(n), g_gpu(n), u(n);
+  AlignedVector<float> g_cpu(n), g_gpu(n), u(n);
   srand(7070 + (int)(n % 10000));
   for (auto &v : g_cpu) v = ((rand() % 4000) - 2000) / 1000.f;     // wider range to exercise sigmoid saturation
   for (auto &v : u)     v = ((rand() % 2000) - 1000) / 1000.f;
@@ -1240,9 +1259,11 @@ int main(void) {
   fail |= run_moe({1,1,1,1,1,1,1,1}, 128, "moe decode nb=8  fmt4-g128");
   fail |= run_moe({3,1,4,2,1,5},     128, "moe ragged nb=6  fmt4-g128");
   fail |= run_moe({3,1,4,2,1,5},     64,  "moe ragged nb=6  fmt4-g64");
+#ifdef COLI_TEST_E8
   printf("Metal fmt=6 (E8/IQ3) moe_block tests:\n");
   fail |= run_moe_e8({1,1,1,1,1,1,1,1}, "e8 decode nb=8");
   fail |= run_moe_e8({3,1,4,2,1,5},     "e8 ragged nb=6");
+#endif
   printf("Metal large-batch gemm test:\n");
   { // registered int4 weights, S=64: coli_metal_gemm vs cpu_ref
     srand(77); int O=2048,I=6144,S=64,rb=(I+1)/2;

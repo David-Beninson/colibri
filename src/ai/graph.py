@@ -11,12 +11,16 @@ Targets Qwen3.6-35B-A3B (`qwen36-35b`) served via `coli serve` with:
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
+import datetime
 import json
+import os
 import re
+import sqlite3
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TypedDict, Union
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple, TypedDict, Union
 
 from .config import AgentConfig
 
@@ -35,24 +39,42 @@ try:
 except ImportError:
     _LANGGRAPH_AVAILABLE = False
 
+try:
+    from langgraph.checkpoint.base import (
+        BaseCheckpointSaver,
+        Checkpoint,
+        CheckpointMetadata,
+        CheckpointTuple,
+    )
+
+    _LANGGRAPH_CP_AVAILABLE = True
+except ImportError:
+    class BaseCheckpointSaver:  # type: ignore
+        pass
+
+    class CheckpointTuple(NamedTuple):  # type: ignore
+        config: Dict[str, Any]
+        checkpoint: Dict[str, Any]
+        metadata: Dict[str, Any]
+        parent_config: Optional[Dict[str, Any]] = None
+
+    _LANGGRAPH_CP_AVAILABLE = False
+
 
 # Default fallback persona if `src/ai/persona.py` is not yet present
 _FALLBACK_PERSONA_PROMPT = (
-    "You are Colibri Holographic Companion, a warm, intelligent, bilingual (Hebrew & English) "
-    "AI companion running locally on Qwen3.6-35B-A3B inside a motorized Pepper's Ghost 3D "
-    "holographic cylinder created with love.\n"
+    "You are Jimmy bot (ג'ימי בוט), a warm, intelligent, bilingual (Hebrew & English) "
+    "AI companion serving the Jimmies family (משפחת ג'ימי), running locally on Qwen3.6-35B-A3B.\n"
     "Guidelines:\n"
-    "1. Internet & Research: Use `web_search`, `fetch_webpage_content`, `deep_web_research`, "
+    "1. Strict Spoken Brevity: Keep default spoken replies to 1–2 short, natural sentences.\n"
+    "2. Internet & Research: Use `web_search`, `fetch_webpage_content`, `deep_web_research`, "
     "`wikipedia_search`, `arxiv_search`, `hackernews_search`, `github_repo_search`, `weather_lookup`, "
     "or `fetch_json_or_rss` for live facts, news, weather, and citations.\n"
-    "2. Vision & Camera: Use `extract_text_from_image` for OCR, `describe_image_scene` for visual "
-    "analysis, and `detect_person_angle` + `rotate_device` to face the user.\n"
     "3. Voice & Bilingual Speech: Respond naturally in the user's language (Hebrew or English). "
     "Use `transcribe_audio` for speech input and `text_to_speech` / `speak_text` when requested.\n"
-    "4. Personal Memory (RAG): Use `query_memory` / `query_local_knowledge` and `save_fact` / "
-    "`save_conversation_fact` to remember and recall personal facts, dates, preferences, and family memories.\n"
-    "5. Exact Computation & Hardware: Use `calculate` or `run_python_calculation` for math/data, "
-    "and `set_avatar_state`, `rotate_device`, or `trigger_hologram_effect` to express emotion on the 3D hologram."
+    "4. Personal Memory (RAG): Use `query_memory`, `save_fact`, `ingest_url_or_note`, and `scale_recipe` "
+    "to remember and recall personal facts, dates, preferences, recipes, and Jimmies family memories.\n"
+    "5. Exact Computation: Use `calculate` or `run_python_calculation` for math and date calculations."
 )
 
 
@@ -88,27 +110,6 @@ def has_langgraph() -> bool:
     return _LANGGRAPH_AVAILABLE
 
 
-def _pulse_avatar(config: AgentConfig, state: str, emotion: str = "warm", subtitle: str = "") -> None:
-    """Automatically update the Pepper's Ghost 3D avatar state when `config.auto_avatar_state` is True."""
-    if not getattr(config, "auto_avatar_state", False):
-        return
-
-    def _do_pulse() -> None:
-        try:
-            from .tools.device import set_avatar_state
-
-            set_avatar_state(state=state, emotion=emotion, subtitle=subtitle[:120])
-        except Exception:  # noqa: BLE001
-            pass
-
-    if getattr(config, "async_avatar_bridge", False):
-        import threading
-
-        threading.Thread(target=_do_pulse, daemon=True).start()
-    else:
-        _do_pulse()
-
-
 def _colibri_extra_body(config: AgentConfig, active_slot: Optional[int] = None) -> Dict[str, Any]:
     """Build Colibri `/v1/chat/completions` extension fields for Qwen3.6 prefix reuse."""
     if getattr(config, "is_ollama_or_metal", False):
@@ -126,41 +127,344 @@ def _colibri_extra_body(config: AgentConfig, active_slot: Optional[int] = None) 
 
 
 _RESEARCH_KEYWORDS_RE = re.compile(
-    r"\b(arxiv|wikipedia|wiki|hackernews|hacker news|github|repo|rss|feed|ocr|image|photo|camera|angle|python|script|deep research|article|http://|https://)\b",
+    r"\b(arxiv|wikipedia|wiki|hackernews|hacker news|github|repo|rss|feed|ocr|image|photo|camera|python|script|deep research|article|http://|https://)\b",
+    re.IGNORECASE,
+)
+
+_URL_INGEST_RE = re.compile(
+    r"(https?://\S+|\b(?:ingest|scrape|bookmark|save\s+(?:this\s+)?(?:url|link|recipe|article|note)|"
+    r"remember\s+this\s+(?:recipe|url|link|note)|שמור\s+(?:את\s+)?(?:המתכון|הקישור|הלינק))\b)",
+    re.IGNORECASE,
+)
+
+_RECIPE_SCALING_RE = re.compile(
+    r"\b(scale\s+(?:the\s+)?recipe|scale\s+to\s+\d+|for\s+\d+\s+(?:servings?|people|guests|portions?)|"
+    r"double\s+the\s+(?:recipe|ingredients?)|halve\s+the\s+(?:recipe|ingredients?)|"
+    r"convert\s+(?:servings?|ingredients?)|הכפל\s+את\s+המתכון|ל-\d+\s+מנות)\b",
+    re.IGNORECASE,
+)
+
+_MEMORY_RECALL_RE = re.compile(
+    r"\b(what\s+(?:is|are|was|were)\s+(?:her|his|my|our|the\s+jimmies|jimmy(?:'s)?)\s+(?:favorite|saved|preferred)|"
+    r"do\s+you\s+remember|recall|from\s+(?:my|our)\s+(?:memory|vault|notes|bookmarks|recipes)|"
+    r"what\s+saved\s+(?:recipes?|bookmarks?|facts?|notes?)|what\s+.*\s+does\s+(?:she|he)\s+love|"
+    r"מה\s+(?:היא|הוא|אנחנו)\s+אוהב|זוכר)\b",
+    re.IGNORECASE,
+)
+
+_FACTUAL_EXTRACTION_RE = re.compile(
+    r"\b(weather|forecast|temperature|calculate|compute|sqrt|sum|solve|search|find|latest|news|"
+    r"arxiv|wikipedia|wiki|hackernews|github|rss|price|stock|who\s+is|what\s+is\s+the\s+capital|"
+    r"מזג\s+האוויר|חשב|חפש)\b|[0-9]+\s*[\+\-\*\/\^]\s*[0-9]+",
     re.IGNORECASE,
 )
 
 
+def classify_user_intent(prompt_text: str, config: Optional[AgentConfig] = None) -> str:
+    """Classify user request into one of 5 canonical intents:
+    - `"url_ingestion"`
+    - `"recipe_scaling"`
+    - `"memory_recall"`
+    - `"factual_extraction"`
+    - `"conversation"`
+    """
+    clean = (prompt_text or "").split("\n\n[LOCAL MEMORY CONTEXT]", 1)[0].strip()
+    if not clean:
+        return "conversation"
+
+    if _RECIPE_SCALING_RE.search(clean):
+        return "recipe_scaling"
+    if _URL_INGEST_RE.search(clean):
+        return "url_ingestion"
+    if _MEMORY_RECALL_RE.search(clean):
+        return "memory_recall"
+    if _FACTUAL_EXTRACTION_RE.search(clean):
+        return "factual_extraction"
+
+    if config is not None and getattr(config, "use_systemone_routing", False) and not getattr(config, "is_ollama_or_metal", False):
+        try:
+            from .systemone import SystemOneClient
+
+            decision = SystemOneClient(config=config).route_query(clean)
+            if decision.choice in ("web_research", "weather_or_math"):
+                return "factual_extraction"
+        except Exception:  # noqa: BLE001
+            pass
+
+    return "conversation"
+
+
+class ColibriSqliteCheckpointer(BaseCheckpointSaver):
+    """Persistent zero-dependency SQLite checkpointer (`data/memory_db/checkpoints.sqlite`).
+
+    Saves and restores multi-turn session history (`thread_id`, `messages`, `intent`,
+    `step_count`, `updated_at`) across process restarts natively for both `StdlibColibriAgent`
+    and LangGraph `StateGraph`.
+    """
+
+    def __init__(self, db_path: Optional[str] = None) -> None:
+        self._explicit_db_path = db_path
+
+    @property
+    def db_path(self) -> str:
+        if self._explicit_db_path:
+            parent = os.path.dirname(os.path.abspath(self._explicit_db_path))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            return os.path.abspath(self._explicit_db_path)
+        from .tools.rag import _memory_dir
+
+        return os.path.join(_memory_dir(), "checkpoints.sqlite")
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, timeout=5.0)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS session_checkpoints (
+                thread_id TEXT PRIMARY KEY,
+                messages_json TEXT NOT NULL,
+                intent TEXT NOT NULL DEFAULT 'conversation',
+                step_count INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        return conn
+
+    @staticmethod
+    def _clean_messages_for_storage(messages: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Strip static system prompt and transient `[LOCAL MEMORY CONTEXT]` suffixes before persisting."""
+        cleaned: List[Dict[str, Any]] = []
+        for m in messages:
+            if not isinstance(m, dict):
+                continue
+            role = str(m.get("role") or "user")
+            if role == "system":
+                continue
+            item = dict(m)
+            if role == "user" and isinstance(item.get("content"), str):
+                item["content"] = item["content"].split("\n\n[LOCAL MEMORY CONTEXT]", 1)[0]
+            cleaned.append(item)
+        return cleaned
+
+    def save_checkpoint(
+        self,
+        thread_id: str,
+        messages: Sequence[Dict[str, Any]],
+        intent: str = "conversation",
+        step_count: int = 0,
+    ) -> None:
+        tid = (thread_id or "default").strip() or "default"
+        clean_msgs = self._clean_messages_for_storage(messages)
+        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        with contextlib.closing(self._connect()) as conn:
+            conn.execute(
+                """
+                INSERT INTO session_checkpoints (thread_id, messages_json, intent, step_count, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(thread_id) DO UPDATE SET
+                    messages_json = excluded.messages_json,
+                    intent = excluded.intent,
+                    step_count = excluded.step_count,
+                    updated_at = excluded.updated_at
+                """,
+                (tid, json.dumps(clean_msgs, ensure_ascii=False), intent, int(step_count), now_iso),
+            )
+            conn.commit()
+
+    def load_checkpoint(self, thread_id: str) -> Optional[Dict[str, Any]]:
+        tid = (thread_id or "default").strip() or "default"
+        if not os.path.isfile(self.db_path):
+            return None
+        try:
+            with contextlib.closing(self._connect()) as conn:
+                row = conn.execute(
+                    "SELECT thread_id, messages_json, intent, step_count, updated_at FROM session_checkpoints WHERE thread_id = ?",
+                    (tid,),
+                ).fetchone()
+            if not row:
+                return None
+            return {
+                "thread_id": row[0],
+                "messages": json.loads(row[1]) if row[1] else [],
+                "intent": row[2],
+                "step_count": int(row[3] or 0),
+                "updated_at": row[4],
+            }
+        except Exception:  # noqa: BLE001
+            return None
+
+    def clear_checkpoint(self, thread_id: str) -> None:
+        tid = (thread_id or "default").strip() or "default"
+        if not os.path.isfile(self.db_path):
+            return
+        with contextlib.closing(self._connect()) as conn:
+            conn.execute("DELETE FROM session_checkpoints WHERE thread_id = ?", (tid,))
+            conn.commit()
+
+    def put(
+        self,
+        config: Dict[str, Any],
+        checkpoint: Dict[str, Any],
+        metadata: Optional[Dict[str, Any]] = None,
+        new_versions: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """LangGraph native checkpoint persistence protocol."""
+        configurable = config.get("configurable", {}) if isinstance(config, dict) else {}
+        tid = str(configurable.get("thread_id") or "default")
+        checkpoint_id = str(checkpoint.get("id") or f"chk_{int(time.time()*1000)}")
+        channel_values = checkpoint.get("channel_values", {})
+        if not isinstance(channel_values, dict):
+            channel_values = {}
+        messages = channel_values.get("messages", [])
+        intent = str(channel_values.get("intent") or "conversation")
+        step_count = int(channel_values.get("step_count") or 0)
+        self.save_checkpoint(thread_id=tid, messages=messages, intent=intent, step_count=step_count)
+        return {
+            "configurable": {
+                "thread_id": tid,
+                "checkpoint_ns": configurable.get("checkpoint_ns", ""),
+                "checkpoint_id": checkpoint_id,
+            }
+        }
+
+    def put_writes(
+        self,
+        config: Dict[str, Any],
+        writes: Sequence[Tuple[str, Any]],
+        task_id: str,
+    ) -> None:
+        """LangGraph task write staging."""
+        pass
+
+    def get_tuple(self, config: Dict[str, Any]) -> Optional[CheckpointTuple]:
+        """LangGraph native checkpoint restoration protocol."""
+        configurable = config.get("configurable", {}) if isinstance(config, dict) else {}
+        tid = str(configurable.get("thread_id") or "default")
+        data = self.load_checkpoint(tid)
+        if not data:
+            return None
+        checkpoint_id = f"chk_{tid}"
+        ckpt = {
+            "v": 1,
+            "id": checkpoint_id,
+            "ts": data.get("updated_at") or datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "channel_values": {
+                "messages": data.get("messages") or [],
+                "intent": data.get("intent") or "conversation",
+                "step_count": int(data.get("step_count") or 0),
+            },
+            "channel_versions": {},
+            "versions_seen": {},
+        }
+        meta = {
+            "source": "input",
+            "step": int(data.get("step_count") or 0),
+            "writes": {},
+            "parents": {},
+        }
+        ret_cfg = {
+            "configurable": {
+                "thread_id": tid,
+                "checkpoint_ns": configurable.get("checkpoint_ns", ""),
+                "checkpoint_id": checkpoint_id,
+            }
+        }
+        return CheckpointTuple(config=ret_cfg, checkpoint=ckpt, metadata=meta, parent_config=None)
+
+    def list(
+        self,
+        config: Optional[Dict[str, Any]] = None,
+        *,
+        filter: Optional[Dict[str, Any]] = None,
+        before: Optional[Dict[str, Any]] = None,
+        limit: Optional[int] = None,
+    ):
+        """List checkpoint tuples matching thread_id."""
+        tid = None
+        if isinstance(config, dict):
+            tid = config.get("configurable", {}).get("thread_id")
+        with contextlib.closing(self._connect()) as conn:
+            if tid:
+                rows = conn.execute(
+                    "SELECT thread_id, messages_json, intent, step_count, updated_at FROM session_checkpoints WHERE thread_id = ? ORDER BY updated_at DESC",
+                    (tid,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT thread_id, messages_json, intent, step_count, updated_at FROM session_checkpoints ORDER BY updated_at DESC",
+                ).fetchall()
+        count = 0
+        for row in rows:
+            if limit and count >= limit:
+                break
+            rtid = row[0]
+            r_msgs = json.loads(row[1]) if row[1] else []
+            r_intent = row[2] or "conversation"
+            r_step = int(row[3] or 0)
+            r_upd = row[4]
+            chk_id = f"chk_{rtid}"
+            ckpt = {
+                "v": 1,
+                "id": chk_id,
+                "ts": r_upd,
+                "channel_values": {"messages": r_msgs, "intent": r_intent, "step_count": r_step},
+                "channel_versions": {},
+                "versions_seen": {},
+            }
+            meta = {"source": "input", "step": r_step, "writes": {}, "parents": {}}
+            ret_cfg = {"configurable": {"thread_id": rtid, "checkpoint_ns": "", "checkpoint_id": chk_id}}
+            yield CheckpointTuple(config=ret_cfg, checkpoint=ckpt, metadata=meta, parent_config=None)
+            count += 1
+
+
+def get_session_history(thread_id: str = "default", db_path: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Return persisted conversational messages for `thread_id` from `checkpoints.sqlite`."""
+    cp = ColibriSqliteCheckpointer(db_path=db_path).load_checkpoint(thread_id)
+    if not cp:
+        return []
+    return list(cp.get("messages") or [])
+
+
 def _needs_full_research_suite(prompt_text: str) -> bool:
     """Return True if the user query explicitly mentions research/vision/code domains outside the fast companion suite."""
+    intent = classify_user_intent(prompt_text)
+    if intent in ("url_ingestion", "recipe_scaling"):
+        return True
     return bool(_RESEARCH_KEYWORDS_RE.search(prompt_text or ""))
 
 
 def _prefetch_local_memory_context(prompt_text: str, config: AgentConfig) -> str:
     """Zero-roundtrip speculative local RAG lookup (<10ms).
 
-    Pre-fetches matching personal facts from `data/memory_db/facts.json` when facts exist
+    Pre-fetches matching personal facts from `data/memory_db/` when facts exist
     so the model can answer personal questions in 1 LLM pass instead of 2.
+    Matches are sorted deterministically by `(key, category)` and stripped of
+    volatile fields (`distance`, `updated_at`) so the prompt prefix stays
+    100% byte-identical across multi-step tool turns.
     """
     if not getattr(config, "prefetch_memory", True) or not prompt_text:
         return ""
+    clean_query = prompt_text.split("\n\n[LOCAL MEMORY CONTEXT]", 1)[0].strip()
+    if not clean_query:
+        return ""
     try:
-        from .tools.rag import _load_facts, query_memory
+        from .tools.rag import _canonical_match_sort_key, _load_facts, query_memory
 
         facts = _load_facts()
         if not facts:
             return ""
-        raw = query_memory(query=prompt_text, k=2)
+        raw = query_memory(query=clean_query, k=2)
         parsed = json.loads(raw)
-        matches = parsed.get("matches") or []
-        # Only inject high-signal matches (avoid injecting unrelated recent fallback)
-        valid = [
-            f"- {m.get('key')}: {m.get('value')}"
-            for m in matches
+        matches = [
+            m
+            for m in (parsed.get("matches") or [])
             if m.get("source") in ("chromadb", "json_vault") and m.get("value")
         ]
-        if not valid:
+        if not matches:
             return ""
+        matches.sort(key=_canonical_match_sort_key)
+        valid = [f"- {m.get('key')}: {m.get('value')}" for m in matches]
         return "\n\n[LOCAL MEMORY CONTEXT]\n" + "\n".join(valid)
     except Exception:  # noqa: BLE001
         return ""
@@ -341,6 +645,14 @@ class AgentRunResult(dict):
     def model(self) -> str:
         return str(self.get("model", ""))
 
+    @property
+    def intent(self) -> str:
+        return str(self.get("intent", "conversation"))
+
+    @property
+    def thread_id(self) -> str:
+        return str(self.get("thread_id", "default"))
+
     def __getattr__(self, name: str) -> Any:
         if name in self:
             return self[name]
@@ -374,12 +686,14 @@ class StdlibColibriAgent:
         on_tool_call: Optional[Callable[[Dict[str, Any], str, float], None]] = None,
         on_token: Optional[Callable[[str], None]] = None,
         stream: bool = False,
+        checkpointer: Optional[ColibriSqliteCheckpointer] = None,
     ) -> None:
         self.config = config or AgentConfig()
         self.system_prompt = system_prompt
         self.on_tool_call = on_tool_call
         self.on_token = on_token
         self.stream = stream
+        self.checkpointer = checkpointer or ColibriSqliteCheckpointer()
 
     def _chat_completions(
         self,
@@ -496,14 +810,21 @@ class StdlibColibriAgent:
                 out_resp["compaction"] = compaction_info
             return out_resp
 
-    def invoke(self, state_or_prompt: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
-        """Execute the `agent -> tools -> reflect_and_guard -> end` state machine."""
+    def invoke(
+        self,
+        state_or_prompt: Union[str, Dict[str, Any]],
+        thread_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Execute the `intent_router -> agent -> tools -> reflect_and_guard -> end` state machine."""
+        resolved_thread_id = (thread_id or "").strip()
         if isinstance(state_or_prompt, str):
             input_messages: List[Dict[str, Any]] = [
                 {"role": "user", "content": state_or_prompt}
             ]
             max_steps = self.config.max_iterations
         else:
+            if not resolved_thread_id and state_or_prompt.get("thread_id"):
+                resolved_thread_id = str(state_or_prompt.get("thread_id")).strip()
             raw_msgs = state_or_prompt.get("messages", [])
             input_messages = []
             for m in raw_msgs:
@@ -517,7 +838,17 @@ class StdlibColibriAgent:
                     )
             max_steps = int(state_or_prompt.get("max_steps") or self.config.max_iterations)
 
-        # Find latest user query for speculative RAG memory prefetch & two-slot tool routing
+        checkpointer = self.checkpointer
+        if resolved_thread_id and len(input_messages) <= 1:
+            tup = checkpointer.get_tuple({"configurable": {"thread_id": resolved_thread_id}})
+            if tup and tup.checkpoint.get("channel_values", {}).get("messages"):
+                input_messages = [*tup.checkpoint["channel_values"]["messages"], *input_messages]
+            else:
+                prior_cp = checkpointer.load_checkpoint(resolved_thread_id)
+                if prior_cp and prior_cp.get("messages"):
+                    input_messages = [*prior_cp["messages"], *input_messages]
+
+        # Find latest user query for intent classification, speculative RAG memory prefetch & two-slot tool routing
         last_user_idx = -1
         last_user_text = ""
         for idx in range(len(input_messages) - 1, -1, -1):
@@ -525,6 +856,8 @@ class StdlibColibriAgent:
                 last_user_idx = idx
                 last_user_text = str(input_messages[idx].get("content") or "")
                 break
+
+        intent = classify_user_intent(last_user_text, self.config)
 
         # Optimization: Zero-roundtrip speculative local RAG lookup (<10ms)
         if last_user_idx >= 0 and "[LOCAL MEMORY CONTEXT]" not in last_user_text:
@@ -561,22 +894,24 @@ class StdlibColibriAgent:
             except Exception:  # noqa: BLE001
                 pass
 
-        # Ensure static system prompt is always at index 0 for KV cache prefix reuse
+        # Ensure static system prompt is always byte-identical at index 0 for KV cache prefix reuse
+        # (never inject dynamic RAG chunks into messages[0]; earlier turns are never mutated)
         if not input_messages or input_messages[0].get("role") != "system":
             messages: List[Dict[str, Any]] = [
                 {"role": "system", "content": self.system_prompt},
                 *input_messages,
             ]
         else:
-            messages = list(input_messages)
+            messages = [
+                {"role": "system", "content": self.system_prompt},
+                *input_messages[1:],
+            ]
 
         step_count = 0
         tool_traces: List[Dict[str, Any]] = []
         compacted_messages = 0
         last_reasoning = ""
         force_finalize = skip_tools_via_sys1
-
-        _pulse_avatar(self.config, "thinking", emotion="curious")
 
         tts_streamer = None
         if getattr(self.config, "stream_tts", False):
@@ -707,7 +1042,23 @@ class StdlibColibriAgent:
         if tts_streamer is not None:
             tts_streamer.flush()
 
-        _pulse_avatar(self.config, "speaking", emotion="warm", subtitle=final_answer)
+        effective_tid = resolved_thread_id or "default"
+        try:
+            checkpointer.put(
+                {"configurable": {"thread_id": effective_tid}},
+                {
+                    "v": 1,
+                    "id": f"chk_{effective_tid}",
+                    "channel_values": {
+                        "messages": messages,
+                        "intent": intent,
+                        "step_count": step_count,
+                    },
+                },
+                {"source": "agent", "step": step_count},
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
         return AgentRunResult(
             answer=final_answer,
@@ -719,6 +1070,8 @@ class StdlibColibriAgent:
             model=self.config.model,
             compacted_messages=compacted_messages,
             reasoning=last_reasoning,
+            intent=intent,
+            thread_id=effective_tid,
         )
 
 
@@ -734,6 +1087,8 @@ if _LANGGRAPH_AVAILABLE:
         max_steps: int
         tool_calls_log: List[Dict[str, Any]]
         force_finalize: bool
+        intent: str
+        thread_id: str
 
 
 def build_internet_agent_graph(
@@ -741,6 +1096,7 @@ def build_internet_agent_graph(
     on_tool_call: Optional[Callable[[Dict[str, Any], str, float], None]] = None,
     on_token: Optional[Callable[[str], None]] = None,
     stream: bool = False,
+    checkpointer: Optional[Any] = None,
 ) -> Any:
     """Build the Colibri Qwen3.6-35B-A3B internet research StateGraph.
 
@@ -749,9 +1105,14 @@ def build_internet_agent_graph(
     interface when running in a zero-dependency environment.
     """
     cfg = config or AgentConfig()
+    active_cp = checkpointer or ColibriSqliteCheckpointer()
     if not _LANGGRAPH_AVAILABLE:
         return StdlibColibriAgent(
-            config=cfg, on_tool_call=on_tool_call, on_token=on_token, stream=stream
+            config=cfg,
+            on_tool_call=on_tool_call,
+            on_token=on_token,
+            stream=stream,
+            checkpointer=active_cp,
         )
 
     use_fast = bool(getattr(cfg, "fast_tool_pruning", False))
@@ -772,7 +1133,6 @@ def build_internet_agent_graph(
     llm_with_tools = llm.bind_tools(lc_tools) if lc_tools else llm
 
     def agent_node(state: InternetAgentState) -> Dict[str, Any]:
-        _pulse_avatar(cfg, "thinking", emotion="curious")
         msgs = list(state.get("messages") or [])
         # Keep static SystemMessage at index 0 so Colibri cache_slot prefix stays valid
         if not msgs or not isinstance(msgs[0], SystemMessage):
@@ -899,12 +1259,24 @@ def build_internet_agent_graph(
             return "reflect_and_guard"
         return END
 
+    def intent_router_node(state: InternetAgentState) -> Dict[str, Any]:
+        msgs = list(state.get("messages") or [])
+        last_user_content = ""
+        for m in reversed(msgs):
+            if isinstance(m, HumanMessage):
+                last_user_content = str(getattr(m, "content", "") or "")
+                break
+        detected_intent = state.get("intent") or classify_user_intent(last_user_content, cfg)
+        return {"intent": detected_intent}
+
     graph = StateGraph(InternetAgentState)
+    graph.add_node("intent_router", intent_router_node)
     graph.add_node("agent", agent_node)
     graph.add_node("tools", tools_node)
     graph.add_node("reflect_and_guard", reflect_and_guard_node)
 
-    graph.add_edge(START, "agent")
+    graph.add_edge(START, "intent_router")
+    graph.add_edge("intent_router", "agent")
     graph.add_conditional_edges(
         "agent",
         route_after_agent,
@@ -917,7 +1289,7 @@ def build_internet_agent_graph(
     graph.add_edge("tools", "reflect_and_guard")
     graph.add_edge("reflect_and_guard", "agent")
 
-    return graph.compile()
+    return graph.compile(checkpointer=active_cp)
 
 
 def run_agent(
@@ -928,15 +1300,20 @@ def run_agent(
     on_tool_call: Optional[Callable[[Dict[str, Any], str, float], None]] = None,
     on_token: Optional[Callable[[str], None]] = None,
     force_stdlib: bool = False,
+    thread_id: Optional[str] = None,
+    checkpointer: Optional[ColibriSqliteCheckpointer] = None,
 ) -> AgentRunResult:
     """Run the Colibri internet research agent on `prompt`.
 
-    Automatically uses the compiled LangGraph `StateGraph` when `langgraph` and
-    `langchain_openai` are installed, or falls back to `StdlibColibriAgent`
-    (`urllib.request`) with identical graph semantics.
+    Automatically uses the compiled LangGraph `StateGraph` with native SQLite
+    checkpointing when `langgraph` and `langchain_openai` are installed, or
+    falls back to `StdlibColibriAgent` (`urllib.request`) with identical
+    state machine semantics and native persistent SQLite checkpointing.
     """
     cfg = config or AgentConfig()
     printed_via_stream = False
+    resolved_tid = (thread_id or "").strip()
+    active_cp = checkpointer or ColibriSqliteCheckpointer()
 
     def _stream_token_cb(tok: str) -> None:
         nonlocal printed_via_stream
@@ -948,24 +1325,37 @@ def run_agent(
 
     token_cb = _stream_token_cb if (stream or on_token is not None) else None
 
+    compiled = build_internet_agent_graph(
+        config=cfg,
+        on_tool_call=on_tool_call,
+        on_token=token_cb,
+        stream=stream,
+        checkpointer=active_cp,
+    )
+
     if force_stdlib or not _LANGGRAPH_AVAILABLE:
-        runner = StdlibColibriAgent(
-            config=cfg,
-            on_tool_call=on_tool_call,
-            on_token=token_cb,
-            stream=stream,
-        )
         msgs: List[Dict[str, Any]] = []
         if history:
             msgs.extend(history)
+        elif resolved_tid:
+            msgs.extend(get_session_history(resolved_tid))
         msgs.append({"role": "user", "content": prompt})
-        res = runner.invoke({"messages": msgs, "max_steps": cfg.max_iterations})
+        invoke_payload: Dict[str, Any] = {"messages": msgs, "max_steps": cfg.max_iterations}
+        if resolved_tid:
+            invoke_payload["thread_id"] = resolved_tid
+        res = compiled.invoke(
+            invoke_payload,
+            thread_id=resolved_tid or None,
+        )
         if stream:
             if printed_via_stream:
                 print(flush=True)
             elif res.answer:
                 print(res.answer, flush=True)
         return res
+
+    effective_history = list(history) if history else (get_session_history(resolved_tid) if resolved_tid else [])
+    intent = classify_user_intent(prompt, cfg)
 
     # Zero-roundtrip speculative local RAG lookup (<10ms)
     enriched_prompt = prompt
@@ -986,15 +1376,9 @@ def run_agent(
         except Exception:  # noqa: BLE001
             pass
 
-    compiled = build_internet_agent_graph(
-        config=cfg,
-        on_tool_call=on_tool_call,
-        on_token=token_cb,
-        stream=stream,
-    )
     lc_messages: List[BaseMessage] = [SystemMessage(content=SYSTEM_PROMPT)]
-    if history:
-        for m in history:
+    if effective_history:
+        for m in effective_history:
             role = m.get("role", "user")
             content = str(m.get("content", ""))
             if role == "system":
@@ -1019,8 +1403,15 @@ def run_agent(
         "max_steps": cfg.max_iterations,
         "tool_calls_log": [],
         "force_finalize": skip_tools_via_sys1,
+        "intent": intent,
+        "thread_id": resolved_tid or "default",
     }
-    final_state = compiled.invoke(initial_state)
+    compile_config = {"configurable": {"thread_id": resolved_tid or "default"}}
+    try:
+        final_state = compiled.invoke(initial_state, config=compile_config)
+    except TypeError:
+        final_state = compiled.invoke(initial_state)
+
     out_messages = final_state.get("messages") or []
     final_answer = ""
     for m in reversed(out_messages):
@@ -1028,17 +1419,25 @@ def run_agent(
             final_answer = str(m.content)
             break
 
-    _pulse_avatar(cfg, "speaking", emotion="warm", subtitle=final_answer)
-
-    serialized_msgs: List[Dict[str, Any]] = []
-    for m in out_messages:
-        role_map = {"system": "system", "human": "user", "ai": "assistant", "tool": "tool"}
-        role = role_map.get(getattr(m, "type", "user"), "user")
-        entry: Dict[str, Any] = {"role": role, "content": str(getattr(m, "content", ""))}
-        if role == "tool":
-            entry["tool_call_id"] = str(getattr(m, "tool_call_id", ""))
-            entry["name"] = str(getattr(m, "name", ""))
-        serialized_msgs.append(entry)
+    if resolved_tid:
+        serialized_msgs: List[Dict[str, Any]] = []
+        for m in out_messages:
+            role_map = {"system": "system", "human": "user", "ai": "assistant", "tool": "tool"}
+            role = role_map.get(getattr(m, "type", "user"), "user")
+            entry: Dict[str, Any] = {"role": role, "content": str(getattr(m, "content", ""))}
+            if role == "tool":
+                entry["tool_call_id"] = str(getattr(m, "tool_call_id", ""))
+                entry["name"] = str(getattr(m, "name", ""))
+            serialized_msgs.append(entry)
+        try:
+            active_cp.save_checkpoint(
+                thread_id=resolved_tid,
+                messages=serialized_msgs,
+                intent=str(final_state.get("intent") or intent),
+                step_count=int(final_state.get("step_count") or 0),
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     if stream:
         if printed_via_stream:
@@ -1056,4 +1455,6 @@ def run_agent(
         model=cfg.model,
         compacted_messages=0,
         reasoning="",
+        intent=str(final_state.get("intent") or intent),
+        thread_id=resolved_tid or "default",
     )

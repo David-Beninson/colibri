@@ -22,12 +22,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/stat.h>
-#ifdef _WIN32
-#include <io.h>
-#include <windows.h>
-#else
 #include <unistd.h>
-#endif
 #include "ggml_quants.h"
 
 enum { GGUF_T_U8 = 0, GGUF_T_I8, GGUF_T_U16, GGUF_T_I16, GGUF_T_U32, GGUF_T_I32,
@@ -310,11 +305,7 @@ static int gguf_open(gguf_ctx *g, const char *path) {
         if (parts > 1) { char *n = pp + ((of - 5) - path); char tmp[16]; snprintf(tmp, sizeof tmp, "%05d", (p + 1) % 100000); memcpy(n, tmp, 5); }
         g->paths[p] = pp;
         if (gguf_parse_one(g, p, pp, p == 0)) { gguf_close(g); return -1; }
-#ifdef _WIN32
-        g->fds[p] = open(pp, O_RDONLY | O_BINARY);
-#else
         g->fds[p] = open(pp, O_RDONLY);
-#endif
         if (g->fds[p] < 0) { snprintf(g->err, sizeof g->err, "%s: %s", pp, strerror(errno)); gguf_close(g); return -1; }
     }
     g->idx_cap = g->n_tensors * 2 + 1;
@@ -334,17 +325,7 @@ static int gguf_read(const gguf_ctx *g, const gguf_tensor *t, void *dst, int64_t
     if (off < 0 || n < 0 || off > t->nbytes || n > t->nbytes - off) return -1;
     uint8_t *p = (uint8_t *)dst; uint64_t pos = t->off + (uint64_t)off; int64_t left = n;
     while (left > 0) {
-#ifdef _WIN32   /* positional, as compat_pread: _lseeki64 + _read share the seek and race between threads */
-        HANDLE h = (HANDLE)_get_osfhandle(g->fds[t->file]);
-        if (h == INVALID_HANDLE_VALUE) return -1;
-        DWORD want = left > (1 << 30) ? (DWORD)(1 << 30) : (DWORD)left, got = 0;
-        OVERLAPPED ov; memset(&ov, 0, sizeof ov);
-        ov.Offset = (DWORD)(pos & 0xFFFFFFFFu); ov.OffsetHigh = (DWORD)(pos >> 32);
-        if (!ReadFile(h, p, want, &got, &ov)) return -1;
-        int64_t r = (int64_t)got;
-#else
         ssize_t r = pread(g->fds[t->file], p, (size_t)(left > (1 << 30) ? (1 << 30) : left), (off_t)pos);
-#endif
         if (r <= 0) { if (r < 0 && errno == EINTR) continue; return -1; }
         p += r; pos += (uint64_t)r; left -= r;
     }

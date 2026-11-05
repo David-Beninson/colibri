@@ -166,100 +166,34 @@ static inline float f16_to_f32(uint16_t h) {
  * loop, which does not vectorize; those (rare in real model weights) fall
  * back to f16_to_f32 per element. Exhaustive verification (all 65536
  * patterns per format) lives in tests/test_st_f16_bf16_simd.c. */
-#if defined(__AVX2__) || defined(__SSE4_1__)
-#include <immintrin.h>
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
 #endif
 
-#if defined(__AVX2__)
 static void bf16_to_f32_bulk(const uint16_t *src, float *dst, int64_t n) {
     int64_t i = 0;
+#if defined(__ARM_NEON)
     for (; i + 8 <= n; i += 8) {
-        __m128i h = _mm_loadu_si128((const __m128i*)(src + i));
-        __m256i w = _mm256_slli_epi32(_mm256_cvtepu16_epi32(h), 16);
-        _mm256_storeu_ps(dst + i, _mm256_castsi256_ps(w));
+        uint16x8_t h = vld1q_u16(src + i);
+        uint32x4_t lo = vshll_n_u16(vget_low_u16(h), 16);
+        uint32x4_t hi = vshll_n_u16(vget_high_u16(h), 16);
+        vst1q_f32(dst + i,     vreinterpretq_f32_u32(lo));
+        vst1q_f32(dst + i + 4, vreinterpretq_f32_u32(hi));
     }
-    for (; i < n; i++) dst[i] = bf16_to_f32(src[i]);
-}
-static void f16_to_f32_bulk(const uint16_t *src, float *dst, int64_t n) {
-    int64_t i = 0;
-    const __m256i vsign_mask = _mm256_set1_epi32(0x8000);
-    const __m256i vexp_mask  = _mm256_set1_epi32(0x1F);
-    const __m256i vman_mask  = _mm256_set1_epi32(0x3FF);
-    const __m256i v112       = _mm256_set1_epi32(112);
-    const __m256i vinfnan_e  = _mm256_set1_epi32(0x7F800000);
-    const __m256i vzero      = _mm256_setzero_si256();
-    const __m256i v31        = _mm256_set1_epi32(31);
-    for (; i + 8 <= n; i += 8) {
-        __m128i h16 = _mm_loadu_si128((const __m128i*)(src + i));
-        __m256i h    = _mm256_cvtepu16_epi32(h16);
-        __m256i sign = _mm256_slli_epi32(_mm256_and_si256(h, vsign_mask), 16);
-        __m256i exp  = _mm256_and_si256(_mm256_srli_epi32(h, 10), vexp_mask);
-        __m256i man  = _mm256_and_si256(h, vman_mask);
-        __m256i normal_u = _mm256_or_si256(sign, _mm256_or_si256(
-            _mm256_slli_epi32(_mm256_add_epi32(exp, v112), 23), _mm256_slli_epi32(man, 13)));
-        __m256i infnan_u = _mm256_or_si256(sign, _mm256_or_si256(vinfnan_e, _mm256_slli_epi32(man, 13)));
-        __m256i exp_is_zero = _mm256_cmpeq_epi32(exp, vzero);
-        __m256i man_is_zero = _mm256_cmpeq_epi32(man, vzero);
-        __m256i is_zero    = _mm256_and_si256(exp_is_zero, man_is_zero);
-        __m256i is_subnorm = _mm256_andnot_si256(man_is_zero, exp_is_zero);
-        __m256i is_infnan  = _mm256_cmpeq_epi32(exp, v31);
-        __m256i result = _mm256_blendv_epi8(normal_u, sign, is_zero);
-        result = _mm256_blendv_epi8(result, infnan_u, is_infnan);
-        _mm256_storeu_ps(dst + i, _mm256_castsi256_ps(result));
-        int m = _mm256_movemask_ps(_mm256_castsi256_ps(is_subnorm));
-        if (m) for (int k = 0; k < 8; k++) if ((m >> k) & 1) dst[i+k] = f16_to_f32(src[i+k]);
-    }
-    for (; i < n; i++) dst[i] = f16_to_f32(src[i]);
-}
-#elif defined(__SSE4_1__)
-static void bf16_to_f32_bulk(const uint16_t *src, float *dst, int64_t n) {
-    int64_t i = 0;
-    for (; i + 4 <= n; i += 4) {
-        __m128i h = _mm_loadl_epi64((const __m128i*)(src + i));
-        __m128i w = _mm_slli_epi32(_mm_cvtepu16_epi32(h), 16);
-        _mm_storeu_ps(dst + i, _mm_castsi128_ps(w));
-    }
-    for (; i < n; i++) dst[i] = bf16_to_f32(src[i]);
-}
-static void f16_to_f32_bulk(const uint16_t *src, float *dst, int64_t n) {
-    int64_t i = 0;
-    const __m128i vsign_mask = _mm_set1_epi32(0x8000);
-    const __m128i vexp_mask  = _mm_set1_epi32(0x1F);
-    const __m128i vman_mask  = _mm_set1_epi32(0x3FF);
-    const __m128i v112       = _mm_set1_epi32(112);
-    const __m128i vinfnan_e  = _mm_set1_epi32(0x7F800000);
-    const __m128i vzero      = _mm_setzero_si128();
-    const __m128i v31        = _mm_set1_epi32(31);
-    for (; i + 4 <= n; i += 4) {
-        __m128i h16 = _mm_loadl_epi64((const __m128i*)(src + i));
-        __m128i h    = _mm_cvtepu16_epi32(h16);
-        __m128i sign = _mm_slli_epi32(_mm_and_si128(h, vsign_mask), 16);
-        __m128i exp  = _mm_and_si128(_mm_srli_epi32(h, 10), vexp_mask);
-        __m128i man  = _mm_and_si128(h, vman_mask);
-        __m128i normal_u = _mm_or_si128(sign, _mm_or_si128(
-            _mm_slli_epi32(_mm_add_epi32(exp, v112), 23), _mm_slli_epi32(man, 13)));
-        __m128i infnan_u = _mm_or_si128(sign, _mm_or_si128(vinfnan_e, _mm_slli_epi32(man, 13)));
-        __m128i exp_is_zero = _mm_cmpeq_epi32(exp, vzero);
-        __m128i man_is_zero = _mm_cmpeq_epi32(man, vzero);
-        __m128i is_zero    = _mm_and_si128(exp_is_zero, man_is_zero);
-        __m128i is_subnorm = _mm_andnot_si128(man_is_zero, exp_is_zero);
-        __m128i is_infnan  = _mm_cmpeq_epi32(exp, v31);
-        __m128i result = _mm_blendv_epi8(normal_u, sign, is_zero);
-        result = _mm_blendv_epi8(result, infnan_u, is_infnan);
-        _mm_storeu_ps(dst + i, _mm_castsi128_ps(result));
-        int m = _mm_movemask_ps(_mm_castsi128_ps(is_subnorm));
-        if (m) for (int k = 0; k < 4; k++) if ((m >> k) & 1) dst[i+k] = f16_to_f32(src[i+k]);
-    }
-    for (; i < n; i++) dst[i] = f16_to_f32(src[i]);
-}
-#else
-static void bf16_to_f32_bulk(const uint16_t *src, float *dst, int64_t n) {
-    for (int64_t i = 0; i < n; i++) dst[i] = bf16_to_f32(src[i]);
-}
-static void f16_to_f32_bulk(const uint16_t *src, float *dst, int64_t n) {
-    for (int64_t i = 0; i < n; i++) dst[i] = f16_to_f32(src[i]);
-}
 #endif
+    for (; i < n; i++) dst[i] = bf16_to_f32(src[i]);
+}
+static void f16_to_f32_bulk(const uint16_t *src, float *dst, int64_t n) {
+    int64_t i = 0;
+#if defined(__ARM_NEON)
+    for (; i + 8 <= n; i += 8) {
+        float16x8_t h = vreinterpretq_f16_u16(vld1q_u16(src + i));
+        vst1q_f32(dst + i,     vcvt_f32_f16(vget_low_f16(h)));
+        vst1q_f32(dst + i + 4, vcvt_f32_f16(vget_high_f16(h)));
+    }
+#endif
+    for (; i < n; i++) dst[i] = f16_to_f32(src[i]);
+}
 
 /* ---- a shard's second descriptor: the reads that run together ----
  * A shard is opened once and every thread preads that descriptor. On Windows a
@@ -323,13 +257,7 @@ static int st_open_fd(shards *S, const char *path) {
     S->paths[S->nfd] = strdup(path); S->fds[S->nfd] = fd;
     S->sizes[S->nfd] = (int64_t)sb.st_size;
     st_shard_pair(fd, compat_open_overlapped(path));
-#ifdef O_DIRECT
-    S->dfds[S->nfd] = open(path, COMPAT_O_RDONLY | O_DIRECT);   /* eager: lookup poi thread-safe */
-#elif defined(__APPLE__) || defined(_WIN32)
-    S->dfds[S->nfd] = compat_open_direct(path);          /* macOS: F_NOCACHE; Windows: NO_BUFFERING */
-#else
-    S->dfds[S->nfd] = -1;                                /* niente equivalente: solo buffered */
-#endif
+    S->dfds[S->nfd] = compat_open_direct(path);
     S->nfd++;
     return fd;
 }
@@ -365,24 +293,12 @@ static int st_direct_fd_rep(shards *S, int fd, int rep) {
  * 6.7 GB of experts (0.27 tok/s; 0.34 without it), GLM-5.2 UD-IQ1_S 6.2-6.6 GB for 3.6. A whole
  * tensor's pread still reads its whole range, so loading the dense matrices does not change. */
 static void st_no_readahead(shards *S, int fd) {
-#if defined(POSIX_FADV_RANDOM) && !defined(_WIN32)
     for (int r = 0; r <= S->nrep; r++) {
         int f = st_fd_rep(S, fd, r);
         if (f >= 0) posix_fadvise(f, 0, 0, POSIX_FADV_RANDOM);
     }
-#else
-    (void)S; (void)fd;
-#endif
 }
 
-/* Registers <dir>/<basename> as read replica S->nrep+1 of every already-indexed
- * shard. A file is accepted ONLY if its size and safetensors header are
- * byte-identical to the primary: the data_offsets then match by construction,
- * so every pread is valid on any copy. Missing or divergent files simply stay
- * on the primary (a mirror may be partial, e.g. a smaller SSD holding only the
- * expert shards). Returns the number of accepted files; a dir contributing 0
- * files claims no replica slot. Mirrors are NEVER written to: .coli_usage /
- * .coli_kv keep deriving from the primary alone. */
 static void st_mirror_reset(shards *S) {           /* re-init: drop every replica */
     for (int r = 0; r < S->nrep; r++) for (int i = 0; i < S->nfd; i++) {
         if (S->mfds[r][i] >= 0) { st_shard_pair(S->mfds[r][i], -1); close(S->mfds[r][i]); }
@@ -398,10 +314,6 @@ static int st_mirror_add(shards *S, const char *dir) {
     S->nmirror[r] = 0;
     for (int i = 0; i < S->nfd; i++) {
         const char *base = strrchr(S->paths[i], '/');
-#ifdef _WIN32
-        const char *b2 = strrchr(S->paths[i], '\\');
-        if (b2 && (!base || b2 > base)) base = b2;
-#endif
         base = base ? base + 1 : S->paths[i];
         char mp[2048]; snprintf(mp, sizeof(mp), "%s/%s", dir, base);
         int mfd = open(mp, COMPAT_O_RDONLY);
@@ -426,11 +338,7 @@ static int st_mirror_add(shards *S, const char *dir) {
         }
         S->mfds[r][i] = mfd;
         st_shard_pair(mfd, compat_open_overlapped(mp));
-#ifdef O_DIRECT
-        S->mdfds[r][i] = open(mp, COMPAT_O_RDONLY | O_DIRECT);
-#elif defined(__APPLE__) || defined(_WIN32)
         S->mdfds[r][i] = compat_open_direct(mp);
-#endif
         S->nmirror[r]++;
     }
     if (S->nmirror[r] > 0) { S->nrep++; return S->nmirror[r]; }
@@ -636,10 +544,6 @@ typedef struct { jval *root, *map; char *arena; int *h; int hcap; int tried; } s
 
 static const char *st_basename(const char *p) {
     const char *b = strrchr(p, '/');
-#ifdef _WIN32
-    const char *b2 = strrchr(p, '\\');
-    if (b2 && (!b || b2 > b)) b = b2;
-#endif
     return b ? b + 1 : p;
 }
 static void st_index_load(st_index *ix, const char *dir) {
@@ -702,9 +606,6 @@ static void st_scan_dir(const char *dir, char files[][1024], int *nf, int *added
             int dup = 0;
             for (int i = 0; i < *nf; i++) {
                 const char *b = strrchr(files[i], '/');
-#ifdef _WIN32
-                const char *b2 = strrchr(files[i], '\\'); if (b2 && (!b || b2 > b)) b = b2;
-#endif
                 b = b ? b + 1 : files[i];
                 if (!strcmp(b, e->d_name)) { dup = 1; break; }  /* already taken from a higher-priority drive */
             }
@@ -1019,10 +920,6 @@ static void st_die_missing(shards *S, const char *name) {
     int lo = -1, hi = -1, declared = 0, numbered = 0;
     for (int i = 0; i < S->nfd; i++) {
         const char *b = strrchr(S->paths[i], '/');
-#ifdef _WIN32
-        const char *b2 = strrchr(S->paths[i], '\\');
-        if (b2 && (!b || b2 > b)) b = b2;
-#endif
         b = b ? b + 1 : S->paths[i];
         int idx, tot;
         if (sscanf(b, "model-%d-of-%d", &idx, &tot) == 2) declared = tot;
@@ -1041,20 +938,9 @@ static void st_die_missing(shards *S, const char *name) {
     else if (numbered > 0)
         fprintf(stderr, "  shards numbered %05d..%05d, %d file(s)%s\n", lo, hi, numbered,
                 numbered == hi - lo + 1 ? " (contiguous: a gap would be at the tail)" : " (GAPS in the numbering)");
-    /* The checkpoint's own index says more than a file count can: which shard
-     * should hold this name, whether that shard is here, and whether the name
-     * exists in this checkpoint at all. The last case is the one a file count
-     * gets exactly wrong: every shard present, and the tensor never existed,
-     * because the engine running here is not this checkpoint's engine (a
-     * directory copied without config.json, and the GLM default looking for
-     * model.embed_tokens.weight in a Qwen3.8 that stores it under
-     * model.language_model). */
     {
         char dir[1200]; snprintf(dir, sizeof dir, "%s", S->paths[0]);
         char *slash = strrchr(dir, '/');
-#ifdef _WIN32
-        char *bs = strrchr(dir, '\\'); if (bs && (!slash || bs > slash)) slash = bs;
-#endif
         if (slash) *slash = 0; else snprintf(dir, sizeof dir, ".");
         st_index ix; memset(&ix, 0, sizeof ix);
         st_index_load(&ix, dir);

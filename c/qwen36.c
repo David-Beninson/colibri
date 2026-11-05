@@ -66,7 +66,6 @@ static int qwen36_max_ctx(void) {
 #include <sys/resource.h>
 #include <unistd.h>
 #endif
-#include "cpu_check.h"   /* the processor runs what this build assumes, or it says so (#1979) */
 #include "serve_poll.h"       /* CANCEL a meta' turno (#1332) */
 #include "cli_args.h"
 #include "st.h"
@@ -77,17 +76,29 @@ static int qwen36_max_ctx(void) {
 #include "decode_batch.h" /* ColiSubmit + coli_submit_ext: le chiavi key=value di SUBMIT */
 #include "json.h"   /* tokenizer.json parsing (reuse minimal parser) */
 #include "tok_unicode.h"        /* is_S/is_L/is_N: the exact pre-tokenizer classes (Clef) */
-#include "tok_unicode_o200k.h"  /* is_U/is_X: the case classes of o200k's letter rules (Flint) */
-#include "tok_unicode_flint.h"  /* is_PS: [\p{P}\p{S}] (Flint) */
+static inline int is_U(uint32_t c){ (void)c; return 0; }
+static inline int is_X(uint32_t c){ (void)c; return 0; }
+static inline int is_PS(uint32_t c){ (void)c; return 0; }
 #include "qwen38_nfc.h"         /* NFC, the tokenizer.json normalizer (Clef) */
-#include "qwen36_tier.h"   /* optional CUDA VRAM expert tier */
-#include "vk_tier.h"       /* optional Vulkan routed-expert tier (COLI_VULKAN=1; stubs without VK=1) */
+
 #include "route_trace.h"   /* the tier's expert history (.coli_usage), kept only while the tier is on */
 #include "draft_vocab.h"   /* the tokens the MTP head scores for a draft (Q36_MTP_VOCAB) */
 #include "expert_ffn.h"    /* routed experts: planar int4 kernel + layer runner */
 #include "idot.h"          /* integer dot kernels for the dense trunk (COLI_DENSE_IDOT, COLI_DENSE_BITS) */
 #include "qwen38_vision.h" /* the ViT: the same tower in Qwen3.5/3.6/3.8 (#1757) */
-#include "lfm3_vision.h"   /* LFM3-VL's tower and projector */
+
+/* Lfm3 stub */
+typedef struct { int attn; } L3VLayer;
+typedef struct {
+    int depth, hidden, heads, kv_heads, head_dim, inter, patch, merge, temporal, in_ch;
+    int out_hidden, proj_hidden;
+    float eps, proj_eps, theta;
+    const float *patchifier, *emb_norm;
+    L3VLayer *layers;
+    const float *ln_w, *ln_b, *l1_w, *l1_b, *l2_w, *l2_b;
+} Lfm3Vision;
+static inline int lfm3_vision_forward(Lfm3Vision *v, const float *p, int h, int w, float *o) { (void)v;(void)p;(void)h;(void)w;(void)o; return -1; }
+
 #include "qwen36_qpack.h"  /* optional MLX-affine qpack routed-expert path */
 #include "affine_quant.h"  /* MLX affine dense triples in model.safetensors */
 #ifdef COLI_METAL
@@ -95,22 +106,11 @@ static int qwen36_max_ctx(void) {
 #endif
 #include "qwen36_embedding.h"     /* the embedding rows read in place from the checkpoint */
 #include "qwen36_dense_file.h"    /* canonical.qc: the INT8 dense matrices, converted once */
-#ifdef COLI_VULKAN
-#include "backend_vulkan.h" /* COLI_VULKAN=1: the resident dense trunk on a Vulkan device */
-static int g_vk_ready = 0;
-static int g_vk_dense = 1;  /* COLI_VK_DENSE=0: the dense trunk stays on the CPU, the expert tier alone uses the device */
-static int g_vk_import = 0; /* COLI_VK_IMPORT: the device reads the int8, f16 and f32 rows where the host keeps them */
-#endif
-/* The dense rows' host allocation. With COLI_VULKAN set (a VK=1 build), page-aligned and
- * a whole number of pages, so a device that shares the CPU's RAM can read them in place
- * (coli_vk_tensor_import) instead of holding a second copy; otherwise malloc. The
- * values, and what the CPU computes from them, are the same either way. */
-#define Q36_PAGE 4096
+/* Apple Silicon Unified Memory: 16 KB page-aligned allocations */
+#define Q36_PAGE 16384
 static int q36_waligned(void){
-#ifdef COLI_VULKAN
-    static int on = -1;
-    if (on < 0) { const char *e = getenv("COLI_VULKAN"); on = e && atoi(e) != 0; }
-    return on;
+#ifdef COLI_METAL
+    return 1;
 #else
     return 0;
 #endif
@@ -160,13 +160,8 @@ static int   g_ssm_a_direct = 0, g_dn_tiled = 0;
 #include <limits.h>
 #endif
 
-#ifdef _WIN32
-#include <windows.h>
-#define sleep_ms(ms) Sleep(ms)
-#else
 #include <dlfcn.h>
 #define sleep_ms(ms) usleep((ms) * 1000)
-#endif
 
 /* ---------- tokenizer (optional, for human-readable output) ---------- */
 static char **g_tok = NULL;   /* id -> piece string (strdup'd) */
@@ -1111,27 +1106,15 @@ static inline int q36_eh(const Cfg *c) { return c->ehid > 0 ? c->ehid : c->hidde
  * reads; ng = I/64 groups per row.
  * gq/gq_type/gs: the matrix as the GGUF stores it (O rows of ggml blocks, times
  * its ".scale" gs), used as is by gq_matmul; set only in GGUF mode, and then
- * w/q/q4/h stay NULL.
- * vk/vk_off: the Vulkan device copy (COLI_VULKAN=1) of whichever of q4, q or w
- * matmul_d reads, uploaded at the first matmul_d and kept; vk_off = the upload
- * failed once, this matrix stays on the CPU. Both stay zero without VK=1. */
+ * w/q/q4/h stay NULL. */
 /* h: the matrix as f16 (COLI_DENSE_BITS=16), the only copy then.
  * wf16: a GGUF's F16 (1) or BF16 (30) matrix: w holds it in f32 for the CPU, and the GPUs
  * get the file's 16-bit rows back from w (q36_wf16_rows, exact) as block format 100 + wf16. */
-/* vk_name, vk_tag, vk_quant: what load_tq read it with, to read it back from disk
- * (q36_dho_reload); vk_fmt, vk_gone: with the dense weights on the device only
- * (COLI_VK_DENSE_HOST), the device copy's format and 1 while no host copy is kept. */
 typedef struct { const float *w; int8_t *q; float *sc; int I, O; uint8_t *q4; float *sg; int ng;
-                 void *vk; int vk_off; uint16_t *h;
-                 char *vk_name; const char *vk_tag; int vk_quant, vk_fmt, vk_gone, vk_imported;
+                 uint16_t *h;
                  uint8_t *gq; int gq_type; float gs; int wf16;
                  int q8r16; } QW;   /* q8r16: q's rows interleaved by 16 (idot.h i8r16_*, q36_trunk_q8_interleave) */
 static void qw_free(QW *w) {
-#ifdef COLI_VULKAN
-    if (w->vk) coli_vk_tensor_free((ColiVkTensor *)w->vk);
-    w->vk = NULL; w->vk_off = 0; w->vk_imported = 0;
-    free(w->vk_name); w->vk_name = NULL; w->vk_gone = 0;
-#endif
     free((void*)w->w); q36_wfree(w->q); free(w->sc); free(w->q4); free(w->sg); q36_wfree(w->h); free(w->gq);
     w->w = NULL; w->q = NULL; w->sc = NULL; w->q4 = NULL; w->sg = NULL; w->ng = 0; w->h = NULL; w->gq = NULL;
 }
@@ -1175,8 +1158,7 @@ typedef struct {
 typedef struct { int eid; int pinned; int is_int4; int8_t *g, *u, *d; uint8_t *g4, *u4, *d4; uint8_t *pw; float *gs, *us, *ds; uint64_t used;
                  unsigned busy; /* callers computing from this slot (expert_hold): never evicted */
                  uint8_t *gqe;  /* GGUF mode: the expert, [gate | up | down] in their held types (GqExp hg/hu/hd) */
-                 int8_t *t8; float *t8s; int t8_eid;   /* GGUF mode, the Vulkan tier: gqe as int8 with one scale per 32 weights (gq_slot_i8),
-                                                          or as the file's rows when gqe holds them interleaved (vk_slot_src), for expert t8_eid - 1 */ } Slot;
+               } Slot;
 /* GGUF mode: where layer L's experts live. The three fused tensors hold
  * n_experts contiguous matrices each; expert e of gate is eb_g bytes at
  * e*eb_g. The types can differ per matrix and per layer (a Q4_K_M file keeps
@@ -1270,7 +1252,6 @@ typedef struct {
     uint8_t *seen;             /* prefill-collected experts (COLIBRI_RESIDENT) */
     int resident_mode;         /* 0 off; 1 pin this-prompt experts (CPU no-evict -> GPU resident) */
     int resident_collecting;   /* prefill in progress, collecting routed experts */
-    int vk_hist;               /* the Vulkan tier is on: routes counted into route_trace.h's history */
     int first_step;            /* the first step() call is the prefill */
     /* Vision, for the turn that carries an image. vis_map maps an ABSOLUTE
      * position to a row of vis_rows or -1; mpos holds the (t, h, w) rope
@@ -1281,13 +1262,6 @@ typedef struct {
     float *vis_rows; int vis_rows_n;
     int *vis_map, vis_map_len;
     int *mpos, mpos_len, rope_delta;
-#ifdef COLI_VULKAN
-    void *vkchain;             /* the dense chain's device state (qwen36_chain.h), NULL until it runs */
-    void *vkchain2;            /* its layers on COLI_VK_DEV2's device, after the primary's (qwen36_chain.h) */
-#endif
-#ifdef COLI_CUDA
-    void *cchain;              /* the CUDA dense chain's device state (qwen36_cuda_chain.h), NULL until it runs */
-#endif
     /* A speculative verify (prompt lookup, q36_spec_step) copies the DeltaNet state
      * after each of its first snap_rows rows, row r into slot r (0 = no copy), so a
      * draft rejected after row r+1 rolls back by swapping slot r in. snap_slots: the
@@ -1443,14 +1417,14 @@ static int  slot_busy(const Slot *s) { return __atomic_load_n(&s->busy, __ATOMIC
  * moe run is still reading. One whose expert the Vulkan tier holds goes first
  * (vkt_ram_first: RAM and VRAM do not keep the same experts when RAM is short). */
 static int slot_victim(const LCache *lc, int layer, int allow_pinned) {
-    int lru = -1, dev = -1;
+    (void)layer;
+    int lru = -1;
     for (int i = 0; i < lc->n; i++) {
         const Slot *s = &lc->slots[i];
         if (s->eid < 0 || slot_busy(s) || (s->pinned && !allow_pinned)) continue;
-        if (vkt_ram_first(layer, s->eid)) { if (dev < 0 || s->used < lc->slots[dev].used) dev = i; continue; }
         if (lru < 0 || s->used < lc->slots[lru].used) lru = i;
     }
-    return dev >= 0 ? dev : lru;
+    return lru;
 }
 
 static void ensure_pilot_worker_started(Model *m) {
@@ -1523,7 +1497,22 @@ static void tm_report(void){
     fprintf(stderr,"[timers] prefill: %ld tokens  dn=%.0f attn=%.0f moe=%.0f(sh=%.0f rt=%.0f) head=%.0f ms\n",
             g_tm_pre_tokens,g_tm_pre[0],g_tm_pre[1],g_tm_pre[2],g_tm_pre[3],g_tm_pre[4],g_tm_pre[5]);
 }
-static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM %ld\n",(long)n);exit(1);} return p; }
+static float *falloc(int64_t n) {
+#ifdef COLI_METAL
+    void *p = NULL;
+    size_t bytes = (size_t)n * sizeof(float);
+    size_t sz = (bytes + Q36_PAGE - 1) / Q36_PAGE * Q36_PAGE;
+    if (posix_memalign(&p, Q36_PAGE, sz ? sz : Q36_PAGE) != 0 || !p) {
+        fprintf(stderr, "OOM %ld\n", (long)n);
+        exit(1);
+    }
+    return (float *)p;
+#else
+    float *p = malloc((size_t)n * sizeof(float));
+    if (!p) { fprintf(stderr, "OOM %ld\n", (long)n); exit(1); }
+    return p;
+#endif
+}
 
 #include "matmul_f32.h"   /* y[S,O] = x[S,I] @ W^T, W [O,I] f32 row-major */
 #include "kv16.h"
@@ -1722,36 +1711,10 @@ static int xf_a32(Model *m) {
  * build computes what a CPU build does. Decided at the first expert, after qt_init. */
 static int xf_r16(Model *m) {
     static int v = -1;
-    if (v < 0) v = xf_a32(m) && !(qt_ready() && qt_experts_on());
+    if (v < 0) v = xf_a32(m);
     return v;
 }
 static int xf_run_mode(Model *m) { return xf_r16(m) ? XF_MODE_R16 : xf_a32(m) ? XF_MODE_A32 : xf_act_mode(); }
-
-/* The single offer decision the decode path makes for a routed expert: offer
- * whichever format the container actually packed, exactly what tier_warmstart
- * does (int4 → the packed g4/u4/d4, int8 → the live RAM weights, tier fmt=1
- * since #1334). moe()'s resident offer, the pilot-prefetch lookahead, and the
- * #1391 test all call THIS function, so the gate can't drift between them.
- * Read-only: never frees, never rewrites -- ownership stays in warmstart
- * (#1341). */
-static int64_t g_pw_gp;   /* bytes of one planar matrix (gate, up or down) in a slot's pw */
-static const uint8_t *gq_slot_file_rows(Model *m, int layer, Slot *e);
-static void tier_offer_slot(Model *m, int layer, int eid, Slot *s) {
-    if (g_gguf) {   /* a GGUF's experts: the file's rows (gq_slot_file_rows), no scales */
-        if (!s->gqe) return;
-        const uint8_t *b = gq_slot_file_rows(m, layer, s);
-        const GqExp *x = &m->gqx[layer];
-        if (b) qt_note(layer, eid, b, b + x->eb_g, b + x->eb_g + x->eb_u, NULL, NULL, NULL);
-        return;
-    }
-    if (s->pw)   /* planar int4 (expert_ffn.h): the tier converts while it stages */
-        qt_note(layer, eid, s->pw, s->pw + g_pw_gp, s->pw + 2 * g_pw_gp, s->gs, s->us, s->ds);
-    else if (s->g4)
-        qt_note(layer, eid, s->g4, s->u4, s->d4, s->gs, s->us, s->ds);
-    else if (!g_expert_is_int4 && s->g)
-        qt_note(layer, eid, (const uint8_t *)s->g, (const uint8_t *)s->u,
-                (const uint8_t *)s->d, s->gs, s->us, s->ds);
-}
 /* Expert-GEMV dispatch: per-row scales (classic) or grouped (gs64 container). */
 static void matmul_qe(float *y, const float *x, const int8_t *q, const float *scale, int I, int O) {
     if (g_expert_gs) matmul_q_gs(y, x, q, scale, I, O, g_expert_gs);
@@ -1887,9 +1850,6 @@ static int dense_keep_i8(void){
     static int v = -1;
     if (v < 0) {
         v = getenv("COLI_DENSE_KEEP_I8") && getenv("COLI_DENSE_KEEP_I8")[0] == '1';
-#ifdef COLI_CUDA
-        { const char *cu = getenv("COLI_CUDA"); if (cu && *cu == '1') v = 1; }
-#endif
     }
     return v;
 }
@@ -1915,161 +1875,7 @@ static void qw_quantize(const float *W, int I, int O, const char *tag, QW *out) 
         } else { free(q4); free(sg); }
     }
 }
-#ifdef COLI_VULKAN
-/* COLI_VULKAN=1: a resident dense matrix answers from the Vulkan device, with
- * the weights the CPU would read, in the order matmul_d picks them: the int4
- * copy when there is one, else the int8 rows (fmt 1, one scale per row), else
- * the f32 matrix (fmt 10, COLI_DENSE_I8=0: the reference path). The planar
- * int4 blocks are not the shader's layout (fmt 4: low nibble = even column),
- * so they are repacked once at upload, nibble for nibble: the same codes v+8
- * and the same per-64 scales, nothing requantized. For the quantized copies
- * only the activation differs from the CPU's default: it stays f32 on the
- * device, where the integer dot rounds it to int8 (COLI_DENSE_IDOT=0 is the
- * CPU arm with the same arithmetic); the f32 matrix differs from the CPU only
- * in the order of the sums. The device copy lives in w->vk from the first
- * call; a failed upload sets vk_off and the matrix stays on the CPU.
- * The backend has one command buffer: never from a parallel region. */
-static void vk_q4_planar_to_fmt4(const QW *w, uint8_t *dst) {
-    const int I = w->I, rb = I / 2, ng = I / 64;
-    for (int o = 0; o < w->O; o++) {
-        const uint8_t *src = w->q4 + (size_t)o * rb;
-        uint8_t *row = dst + (size_t)o * rb;
-        for (int g = 0; g < ng; g++)
-            for (int p = 0; p < 32; p++) {
-                int lo = 2 * p, hi = 2 * p + 1;   /* columns g*64+lo, g*64+hi */
-                uint8_t a = lo < 32 ? (src[g * 32 + lo] & 15) : (src[g * 32 + lo - 32] >> 4);
-                uint8_t b = hi < 32 ? (src[g * 32 + hi] & 15) : (src[g * 32 + hi - 32] >> 4);
-                row[g * 32 + p] = (uint8_t)(a | (b << 4));
-            }
-    }
-}
-static uint16_t *q36_wf16_rows(const QW *w);
-static unsigned g_vk_placed[4];   /* uploads by format: int8 rows, int4, f32, f16 */
-static int g_q36_vk_dev;          /* the device vk_qw_tensor uploads a new matrix to: 1 for the
-                                   * chain's layers on COLI_VK_DEV2's (qwen36_chain.h) */
-/* The format a matrix goes to the device in: the copy matmul_d reads (int4, int8 rows,
- * f16 with COLI_DENSE_BITS=16, else f32), its rows and its scales. */
-static int vk_qw_fmt(const QW *w, const void **wq, const float **sc) {
-    if (w->vk_gone) { *wq = NULL; *sc = NULL; return w->vk_fmt; }
-    if (w->gq) {   /* a GGUF's: its blocks, the file's type (vk_qw_tensor gives the device the file's rows) */
-        const int base = gq_r16_base(w->gq_type);
-        *wq = w->gq; *sc = NULL;
-        return 100 + (base >= 0 ? base : w->gq_type);
-    }
-    if (w->q4) { *wq = w->q4; *sc = w->sg; return 4; }
-    if (w->q) { *wq = w->q; *sc = w->sc; return 1; }
-    if (w->h) { *wq = w->h; *sc = NULL; return 14; }
-    *wq = w->w; *sc = NULL;
-    /* a GGUF's F16 or BF16: the block format of its 16 bits (vk_qw_tensor rebuilds them from w),
-     * the block formats' GEMVs and tiled GEMMs; fmt 10 (f32, no scales) where the device lacks it */
-    if (w->wf16 && w->I % 32 == 0 && coli_vk_block_elems(100 + w->wf16)) return 100 + w->wf16;
-    return 10;
-}
-static void q36_dho_reload(QW *w);
-/* w's device copy, uploaded on the first call (the int4 copy repacked); NULL when it
- * cannot be (vk_off then keeps the matrix on the CPU). The dense chain reads the same
- * tensor, so the per-matrix path and the chain never hold a matrix twice. With
- * COLI_VK_IMPORT and host copies retained (or an integrated GPU), the int8 and f16
- * rows are not copied: the device reads q36_walloc's pages in place, and a matrix
- * the import refuses is copied as before. */
-static ColiVkTensor *vk_qw_tensor(const QW *w) {
-    if (w->vk_off) return NULL;
-    QW *mw = (QW *)w;   /* vk is a cache in a matrix the forward pass treats as read-only */
-    ColiVkTensor **t = (ColiVkTensor **)&mw->vk;
-    if (*t) return *t;
-    if (w->vk_gone) return NULL;
-    int I = w->I, O = w->O;
-    const void *wq; const float *sc;
-    int fmt = vk_qw_fmt(w, &wq, &sc), gs = fmt == 4 ? 64 : 0;
-    if (!wq) return NULL;
-    int ok;
-    if (w->gq || fmt >= 100) {   /* a GGUF's blocks for the dense chain (blockdec.glsl), as the file has them */
-        const int be = coli_vk_block_elems(fmt);
-        if ((w->gq && w->gs != 1.f) || !be || I % be) { mw->vk_off = 1; return NULL; }   /* no device form, or a scale the shader lacks */
-        uint8_t *rows = NULL;
-        if (!w->gq) {   /* F16, BF16: their 16 bits again */
-            if (!(rows = (uint8_t *)q36_wf16_rows(w))) { mw->vk_off = 1; return NULL; }
-        } else if (gq_r16_base(w->gq_type) >= 0 && !(rows = malloc((size_t)gq_row_bytes(fmt - 100, I) * O))) { mw->vk_off = 1; return NULL; }
-        else if (rows) gq_r16_unpack(w->gq_type, rows, w->gq, O, I);
-        const void *src = rows ? (const void *)rows : (const void *)w->gq;
-        ok = g_q36_vk_dev ? coli_vk_tensor_ensure2(t, src, NULL, fmt, I, O, 0) : coli_vk_tensor_ensure(t, src, NULL, fmt, I, O, 0);
-        free(rows);
-        if (!ok) { mw->vk_off = 1; return NULL; }
-        g_vk_placed[2]++;
-        return *t;
-    }
-    /* On an integrated device these are already one shared allocation. Retain
-     * it instead of moving the same physical bytes into a smaller logical
-     * device-local heap. q36_dho_drop keeps imported pages alive. */
-    if (g_q36_vk_dev) {   /* the second device: a copy there (no import, no per-matrix path) */
-        uint8_t *packed = w->q4 ? malloc((size_t)O * (I / 2)) : NULL;
-        if (packed) vk_q4_planar_to_fmt4(w, packed);
-        ok = (!w->q4 || packed) && coli_vk_tensor_ensure2(t, w->q4 ? (const void *)packed : wq, sc, fmt, I, O, gs);
-        free(packed);
-        if (!ok) { mw->vk_off = 1; return NULL; }
-        g_vk_placed[fmt == 1 ? 0 : fmt == 4 ? 1 : fmt == 14 ? 3 : 2]++;
-        return *t;
-    }
-    if (g_vk_import && (coli_vk_device_integrated() || !coli_vk_dense_device_only()) &&
-        fmt != 4 && w->w != wq) {   /* q36_walloc'd rows (f32 rows are falloc's) */
-        size_t rb = fmt == 1 ? (size_t)I : (size_t)I * 2;
-        size_t alloc = (rb * (size_t)O + Q36_PAGE - 1) / Q36_PAGE * Q36_PAGE;
-        if (coli_vk_tensor_import(t, wq, alloc, sc, fmt, I, O, gs)) {
-            mw->vk_imported = 1;
-            g_vk_placed[fmt == 1 ? 0 : 3]++;
-            return *t;
-        }
-    }
-    if (w->q4) {
-        uint8_t *packed = malloc((size_t)O * (I / 2));
-        if (packed) vk_q4_planar_to_fmt4(w, packed);
-        ok = packed && coli_vk_tensor_ensure(t, packed, sc, fmt, I, O, gs);
-        free(packed);
-    } else ok = coli_vk_tensor_ensure(t, wq, sc, fmt, I, O, gs);
-    if (!ok) { mw->vk_off = 1; return NULL; }
-    g_vk_placed[fmt == 1 ? 0 : fmt == 4 ? 1 : fmt == 14 ? 3 : 2]++;
-    return *t;
-}
-static int vk_dense_matmul(float *y, const float *x, const QW *w, int S, int I, int O) {
-#ifdef _OPENMP
-    if (omp_in_parallel()) return 0;
-#endif
-    if (w->vk_off || w->I != I || w->O != O || S < 1 || S > 65535) return 0;
-    const void *wq; const float *sc;
-    int fmt = vk_qw_fmt(w, &wq, &sc), gs = fmt == 4 ? 64 : 0;
-    if (!wq && !w->vk_gone) return 0;
-    ColiVkTensor *t = vk_qw_tensor(w);
-    if (!t || coli_vk_tensor_dev(t)) return 0;   /* a matrix of the second device's layers: only its chain reads it */
-    /* a verify's rows (g_q36_rowwise) one at a time: a decode step's GEMV, not the batch's GEMM */
-    if (g_q36_rowwise && S > 1) {
-        for (int s = 0; s < S; s++)
-            if (!coli_vk_matmul(&t, y + (int64_t)s * O, x + (int64_t)s * I, wq, sc, fmt, 1, I, O, gs)) return 0;
-        return 1;
-    }
-    return coli_vk_matmul(&t, y, x, wq, sc, fmt, S, I, O, gs);
-}
-/* One line at the end of a run or a serve turn: how many matmuls the device
- * really answered, so a test can tell a used path from an initialised one. */
-/* The tier's line and, while it keeps one, its history: at every run and turn end. */
-static char g_vk_usage[2100];   /* where the tier's history lives (vk_tier_start) */
-static void vk_tier_turn(Model *m, const char *scope) {
-    if (!m->vk_hist) return;
-    vkt_report(scope, m->hits, m->miss);
-    rt_save(g_vk_usage, 1);
-}
-static void vk_report(void) {
-    if (!g_vk_ready) return;
-    size_t bytes = 0, tensors = 0;
-    coli_vk_mem_info(&bytes, &tensors);
-    char more[96] = "";
-    size_t imp = coli_vk_imported_bytes();
-    if (g_vk_placed[3] || imp)
-        snprintf(more, sizeof more, ", f16 %u; %.1f MiB read in place", g_vk_placed[3], imp / 1048576.0);
-    fprintf(stderr, "[VK] qwen36: %llu matmuls on the GPU (%zu matrices resident, %.1f MiB; placed int8 %u, int4 %u, f32 %u%s)\n",
-            coli_vk_matmul_calls(), tensors, bytes / 1048576.0,
-            g_vk_placed[0], g_vk_placed[1], g_vk_placed[2], more);
-}
-#endif
+
 /* f32 -> f16, round to nearest even: exact for a value that came from f16 (the
  * container, a GGUF's F16), which is the only use (COLI_DENSE_BITS=16, q36_wf16_rows). */
 static uint16_t f32_to_f16_bits(float f){
@@ -2165,11 +1971,6 @@ static void matmul_d(float *y, const float *x, const QW *w, int S, int I, int O)
         if (w->gs != 1.f) for (int64_t i = 0; i < (int64_t)S * O; i++) y[i] *= w->gs;
         return;
     }
-#ifdef COLI_VULKAN
-    if (g_vk_ready && g_vk_dense && (w->q || w->q4 || w->w || w->h || w->vk_gone) && vk_dense_matmul(y, x, w, S, I, O)) return;
-    /* the CPU needs a matrix the device holds alone (a lost device): read it back */
-    if (w->vk_gone) q36_dho_reload((QW *)w);
-#endif
     if (w->h) { matmul_h(y, x, w->h, S, I, O); return; }
     if (w->q || w->q4) {
         if (w->q4 || dense_idot_on()) {
@@ -2251,31 +2052,18 @@ static void q36_trunk_q8_interleave(Model *m) {
  * a device matmul, or 0 and the caller runs matmul_d as before. The
  * tier turns a failing handle off itself, so the fallback is permanent. */
 static inline int qtd_batch(int hp1, float *y, const float *x, int S, int I, int O){
-    return hp1 > 0 && qt_dense_matmul_batch(hp1 - 1, y, x, S, I, O);
+    (void)hp1; (void)y; (void)x; (void)S; (void)I; (void)O; return 0;
 }
 static inline int qtd(int hp1, float *y, const float *x, int I, int O){
-    return hp1 > 0 && qt_dense_matmul(hp1 - 1, y, x, I, O);
+    (void)hp1; (void)y; (void)x; (void)I; (void)O; return 0;
 }
 /* Bytes of w's dense-i8 copy (int8 rows + per-row scales), 0 when there is
  * none (COLI_DENSE_I8=0): nothing to offer, the CPU path stands. */
 /* A GGUF matrix on the CUDA device: the backend's block format 100 + its type, the file's
  * rows (back from the CPU's copy interleaved by 16), each padded to words there; 0 when the
  * backend does not take the type or the tensor carries a scale the kernels lack. */
-#ifdef COLI_CUDA
-int coli_cuda_block_elems(int fmt);
-#endif
 static int qdw_gq_fmt(const QW *w) {
-#ifdef COLI_CUDA
-    if (g_gguf && !w->gq && w->wf16 && w->w) {   /* F16, BF16: blocks of 32 of their 16 bits (q36_wf16_rows) */
-        const int be = coli_cuda_block_elems(100 + w->wf16);
-        return be > 0 && w->I % be == 0 && w->I % 32 == 0 ? 100 + w->wf16 : 0;
-    }
-    if (!g_gguf || !w->gq || w->gs != 1.f) return 0;
-    const int r = gq_r16_base(w->gq_type), t = r >= 0 ? r : w->gq_type, be = coli_cuda_block_elems(100 + t);
-    return be > 0 && w->I % be == 0 && w->I % 32 == 0 ? 100 + t : 0;
-#else
     (void)w; return 0;
-#endif
 }
 static size_t qdw_gq_bytes(const QW *w) {
     const int fmt = qdw_gq_fmt(w);
@@ -2296,16 +2084,8 @@ static size_t qdw_bytes(const QW *w){
 }
 /* Upload w's dense-i8 copy (a GGUF's: its blocks) to `dev`; handle+1, or 0 when it stays on the CPU. */
 static int qdw_place(const QW *w, int dev){
-    if (dev == QT_PLACE_CPU) return 0;
-    if (!w->q) {
-        const int fmt = qdw_gq_fmt(w);
-        uint8_t *rows; const void *src = fmt ? qdw_gq_rows(w, fmt, &rows) : NULL;
-        int h = src ? qt_dense_init_fmt(src, NULL, fmt, w->I, w->O, dev) : -1;
-        if (src) free(rows);
-        return h >= 0 ? h + 1 : 0;
-    }
-    int h = qt_dense_init(w->q, w->sc, w->I, w->O, dev);
-    return h >= 0 ? h + 1 : 0;
+    (void)w; (void)dev;
+    return 0;
 }
 
 /* rmsnorm over a row of length D (in-place capable: out may == x).
@@ -3055,14 +2835,11 @@ static void qwen_dense_file_open(Model *m, const char *snap, int full) {
     if (path && !*path) path = NULL;   /* empty: unset */
     char beside[1100]; struct stat st;
     int usable = full && dense_i8_on() && dense_bits() == 8 && !getenv("COLI_KEEP_F32") && !q36_waligned();
-#ifdef COLI_CUDA
-    { const char *cu = getenv("COLI_CUDA"); if (cu && *cu == '1') usable = 0; }
-#endif
 #if defined(COLI_SEGMENT_ADAPTER) || defined(COLI_EDGE_ADAPTER)
     usable = 0;
 #endif
     if (!usable) {
-        if (path) { fprintf(stderr, "[qwen-dense] QWEN_DENSE_CACHE needs the whole model in INT8 (COLI_DENSE_BITS=8, not COLI_DENSE_I8=0), without COLI_KEEP_F32, COLI_CUDA=1, COLI_VULKAN=1 or an adapter\n"); exit(1); }
+        if (path) { fprintf(stderr, "[qwen-dense] QWEN_DENSE_CACHE needs the whole model in INT8 (COLI_DENSE_BITS=8, not COLI_DENSE_I8=0), without COLI_KEEP_F32 or an adapter\n"); exit(1); }
         return;
     }
     int named = path != NULL;
@@ -3184,7 +2961,7 @@ static void load_tq(Model *m, const char *name, int I, int O, int quantize, cons
     float *p = load_t_n(m, name, (int64_t)I * O);
     out->w = p; out->q = NULL; out->sc = NULL; out->I = I; out->O = O;
     out->q4 = NULL; out->sg = NULL; out->ng = 0;
-    out->vk = NULL; out->vk_off = 0; out->h = NULL;
+    out->h = NULL;
     if (!quantize || !dense_i8_on()) return;
     if (dense_bits() == 16) {
         uint16_t *h = q36_walloc((size_t)I * O * sizeof(uint16_t));
@@ -3202,72 +2979,7 @@ static void load_tq(Model *m, const char *name, int I, int O, int quantize, cons
  * quantized) for q36_dho_reload. Every resident dense matrix of the model loads here. */
 static void load_tq_noted(Model *m, const char *name, int I, int O, int quantize, const char *tag, QW *out) {
     load_tq(m, name, I, O, quantize, tag, out);
-#ifdef COLI_VULKAN
-    out->vk_name = strdup(name); out->vk_tag = tag; out->vk_quant = quantize;
-    out->vk_fmt = 0; out->vk_gone = 0;
-    if (!out->vk_name) { fprintf(stderr, "OOM dense matrix name\n"); exit(1); }
-#endif
 }
-#ifdef COLI_VULKAN
-/* ---- dense weights on the device only (COLI_VK_DENSE_HOST) ------------------------
- * With the dense part on the device (the chain, or COLI_VK_DENSE), every resident
- * dense matrix goes up at start and its host copy (int8 rows, the int4 copy, f32 or f16) is
- * given back. The CPU then never multiplies by it, except after a lost device:
- * matmul_d first reads it back here, through load_tq with what it was loaded with
- * (the same quantization, so the same bytes), and keeps it from there on. What keeps
- * its host copy: the embedding (its rows are gathered on the CPU), the DeltaNet's
- * dn_a/dn_b and the shared expert's gate vector (the CPU's DeltaNet and shared expert
- * read them, and the chain uploads its own copies), norms, the vision tower, a matrix
- * the device refused, or rows it already imported in place. */
-static Model *g_q36_dho_model;
-static pthread_mutex_t g_q36_dho_mx = PTHREAD_MUTEX_INITIALIZER;
-static size_t q36_dho_host_bytes(const QW *w) {
-    size_t b = 0;
-    if (w->q4) b += (size_t)w->O * (w->I / 2) + (size_t)w->O * (w->I / 64) * sizeof(float);
-    if (w->q) b += (size_t)w->O * w->I + (size_t)w->O * sizeof(float);
-    if (w->w) b += (size_t)w->O * w->I * sizeof(float);
-    if (w->h) b += (size_t)w->O * w->I * sizeof(uint16_t);
-    return b;
-}
-static void q36_dho_reload(QW *w) {
-    pthread_mutex_lock(&g_q36_dho_mx);
-    if (w->vk_gone) {
-        Model *m = g_q36_dho_model;
-        if (!m || !w->vk_name) { fprintf(stderr, "[VK] qwen36: a dense matrix the device held alone cannot be read back\n"); exit(1); }
-        QW t; memset(&t, 0, sizeof t);
-        load_tq(m, w->vk_name, w->I, w->O, w->vk_quant, w->vk_tag, &t);
-        w->w = t.w; w->q = t.q; w->sc = t.sc; w->q4 = t.q4; w->sg = t.sg; w->ng = t.ng; w->h = t.h;
-        w->vk_gone = 0;
-        coli_vk_dense_host_reloaded(q36_dho_host_bytes(w));
-    }
-    pthread_mutex_unlock(&g_q36_dho_mx);
-}
-static void q36_dho_drop(QW *w, size_t *bytes, int *n) {
-    if (!w->vk_name || w->vk_gone || w->vk_off || w->vk_imported || !(w->q || w->q4 || w->w || w->h)) return;
-    const void *wq; const float *sc;
-    int fmt = vk_qw_fmt(w, &wq, &sc);
-    if (!vk_qw_tensor(w) || w->vk_imported) return;   /* refused or still read in place: keep its host pages */
-    size_t b = q36_dho_host_bytes(w);
-    free((void *)w->w); q36_wfree(w->q); free(w->sc); free(w->q4); free(w->sg); q36_wfree(w->h);
-    w->h = NULL; w->w = NULL; w->q = NULL; w->sc = NULL; w->q4 = NULL; w->sg = NULL;
-    w->vk_fmt = fmt; w->vk_gone = 1;
-    coli_vk_dense_host_dropped(b);
-    *bytes += b; (*n)++;
-}
-static void q36_dho_count(QW *w, size_t *bytes, int *n) {
-    if (w->vk_name && !w->vk_off && !w->vk_imported && (w->q || w->q4 || w->w || w->h)) { *bytes += q36_dho_host_bytes(w); (*n)++; }
-}
-/* Every resident dense matrix: the head, then each layer's. */
-static void q36_dho_each(Model *m, void (*f)(QW *, size_t *, int *), size_t *bytes, int *n) {
-    f(&m->lm_head, bytes, n);
-    for (int i = 0; i < m->c.n_layers; i++) {
-        Layer *l = &m->L[i];
-        QW *ws[] = {&l->q, &l->k, &l->v, &l->o, &l->gate, &l->sh_g, &l->sh_u, &l->sh_d,
-                    &l->dn_qkv, &l->dn_z, &l->dn_out};
-        for (size_t k = 0; k < sizeof ws / sizeof ws[0]; k++) f(ws[k], bytes, n);
-    }
-}
-#endif
 
 /* ---------- vision (#1757) ----------
  * The weights are the checkpoint's own model.visual.*, copied by the converter,
@@ -3348,67 +3060,7 @@ static float *l3v_load(Model *m, const char *hf, const char *gg, int64_t want) {
     return p;
 }
 static void q36_load_lfm3_vision(Model *m) {
-    Cfg *c = &m->c;
-    Lfm3Vision *v = &m->lvis;
-    memset(v, 0, sizeof *v);
-    v->depth = c->vis_depth; v->hidden = c->vis_hidden; v->heads = c->vis_heads; v->kv_heads = c->vis_kv_heads;
-    v->head_dim = c->vis_hidden / c->vis_heads; v->inter = c->vis_inter; v->patch = c->vis_patch;
-    v->merge = c->vis_merge; v->temporal = c->vis_temporal; v->in_ch = c->vis_in_ch;
-    v->out_hidden = c->vis_out_hidden; v->proj_hidden = c->vis_proj_hidden;
-    v->eps = c->vis_eps; v->proj_eps = 1e-6f; v->theta = c->vis_theta;
-    const int D = v->hidden, F = v->inter, hd = v->head_dim, PP = v->patch * v->patch, PD = v->in_ch * v->temporal * PP;
-    if (g_mmproj_open) {   /* one [D, C, P, P] kernel a frame: patchifier[o][c][t][p] = frame t's [o][c][p] */
-        float *pw = falloc((int64_t)D * PD);
-        for (int t = 0; t < v->temporal; t++) {
-            char nm[64];
-            if (t) snprintf(nm, sizeof nm, "v.patch_embd.weight.%d", t); else snprintf(nm, sizeof nm, "v.patch_embd.weight");
-            float *f = l3v_load(m, NULL, nm, (int64_t)D * v->in_ch * PP);
-            for (int o = 0; o < D; o++)
-                for (int ch = 0; ch < v->in_ch; ch++)
-                    memcpy(pw + (size_t)o * PD + ((size_t)ch * v->temporal + t) * PP, f + ((size_t)o * v->in_ch + ch) * PP, PP * sizeof(float));
-            free(f);
-        }
-        v->patchifier = pw;
-    } else v->patchifier = l3v_load(m, "model.vision_tower.patchifier.weight", NULL, (int64_t)D * PD);
-    v->emb_norm = l3v_load(m, "model.vision_tower.embedding_norm.weight", "v.embedding_norm.weight", D);
-    v->layers = calloc((size_t)v->depth, sizeof(L3VLayer));
-    if (!v->layers) { fprintf(stderr, "OOM vision layers\n"); exit(1); }
-    for (int i = 0; i < v->depth; i++) {
-        L3VLayer *L = &v->layers[i];
-        char h[160], g[96];
-        #define L3V(dst, hfs, ggs, n) do { snprintf(h, sizeof h, "model.vision_tower.layers.%d.%s.weight", i, hfs); \
-                                           snprintf(g, sizeof g, "v.blk.%d.%s.weight", i, ggs); dst = l3v_load(m, h, g, n); } while (0)
-        L->attn = (int)((c->vis_attn >> i) & 1);
-        L3V(L->op_norm, "operator_norm", "ln1", D);
-        L3V(L->ffn_norm, "ffn_norm", "ln2", D);
-        if (L->attn) {
-            L3V(L->q, "self_attn.q_proj", "attn_q", (int64_t)v->heads * hd * D);
-            L3V(L->k, "self_attn.k_proj", "attn_k", (int64_t)v->kv_heads * hd * D);
-            L3V(L->v, "self_attn.v_proj", "attn_v", (int64_t)v->kv_heads * hd * D);
-            L3V(L->o, "self_attn.out_proj", "attn_out", (int64_t)D * v->heads * hd);
-            L3V(L->qn, "self_attn.q_layernorm", "attn_q_norm", hd);
-            L3V(L->kn, "self_attn.k_layernorm", "attn_k_norm", hd);
-        } else {
-            L3V(L->in_proj, "conv.in_proj", "conv2d_in_proj", (int64_t)3 * D * D);
-            L3V(L->spatial, "conv.spatial_conv", "conv2d_spatial", (int64_t)D * 9);
-            L3V(L->out_proj, "conv.out_proj", "conv2d_out_proj", (int64_t)D * D);
-        }
-        L3V(L->w1, "feed_forward.w1", "ffn_gate", (int64_t)F * D);
-        L3V(L->w3, "feed_forward.w3", "ffn_up", (int64_t)F * D);
-        L3V(L->w2, "feed_forward.w2", "ffn_down", (int64_t)D * F);
-        #undef L3V
-    }
-    const int W4 = D * v->merge * v->merge, P = v->proj_hidden;
-    v->ln_w = l3v_load(m, "model.multi_modal_projector.layer_norm.weight", "mm.input_norm.weight", D);
-    v->ln_b = l3v_load(m, "model.multi_modal_projector.layer_norm.bias", "mm.input_norm.bias", D);
-    v->l1_w = l3v_load(m, "model.multi_modal_projector.linear_1.weight", "mm.0.weight", (int64_t)P * W4);
-    v->l1_b = l3v_load(m, "model.multi_modal_projector.linear_1.bias", "mm.0.bias", P);
-    v->l2_w = l3v_load(m, "model.multi_modal_projector.linear_2.weight", "mm.2.weight", (int64_t)v->out_hidden * P);
-    v->l2_b = l3v_load(m, "model.multi_modal_projector.linear_2.bias", "mm.2.bias", v->out_hidden);
-    m->vis_ready = 1;
-    int na = 0; for (int i = 0; i < v->depth; i++) na += v->layers[i].attn;
-    fprintf(stderr, "[qwen36] LFM3 vision tower%s: %d layers (%d attention, %d convolution), hidden %d, %d heads over %d, patch %d, merge %d\n",
-            g_mmproj_open ? " (mmproj)" : "", v->depth, na, v->depth - na, D, v->heads, v->kv_heads, v->patch, v->merge);
+    (void)m;
 }
 /* an mmproj's shape (clip.vision.*) into the config: LFM3's tower, the layers with attention
  * those that carry attn_q. 0 when the file is not one. */
@@ -4019,7 +3671,6 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
                 fprintf(stderr, "[qwen36] embedding: rows read in place from the checkpoint, COLI_EMBED_MMAP=0 builds the f32 table\n");
             else
                 m->embed = load_t_n(m, "model.embed_tokens.weight", (int64_t)c->vocab * c->hidden);
-#ifndef COLI_VULKAN
             if (quantize_dense && dense_bits() == 16) {   /* 16-bit trunk: the table too, 2.5 GB less on the 27B */
                 int64_t n = (int64_t)c->vocab * c->hidden;
                 m->embed_h = malloc((size_t)n * sizeof(uint16_t));
@@ -4028,7 +3679,6 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
                 for (int64_t k = 0; k < n; k++) m->embed_h[k] = f32_to_f16_bits(m->embed[k]);
                 free(m->embed); m->embed = NULL;
             }
-#endif
         }
         load_tq_noted(m, "lm_head.weight", c->hidden, c->vocab, quantize_dense, "lmhead", &m->lm_head);
         if (m->lm_head.q || m->lm_head.q4 || m->lm_head.h) { qcount++; qfreed += (double)c->hidden * c->vocab * sizeof(float); }
@@ -4277,6 +3927,8 @@ static int qwen36_cap_for_ram(double resident_gb, double avail_gb, double ram_gb
     return derived;
 }
 
+static int64_t g_pw_gp;   /* bytes of one planar matrix (gate, up or down) in a slot's pw */
+
 static void slot_ensure_allocated(Model *m, Slot *s) {
     if (s->g || s->pw || s->gqe) return;
     Cfg *c = &m->c;
@@ -4378,11 +4030,6 @@ static void unpack_int4_to_int8(int8_t *out, const uint8_t *raw, int64_t n)
 }
 
 static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
-    /* new bytes in the slot: the copy derived from the last ones (gq_slot_i8's int8,
-     * gq_slot_file_rows' file rows, keyed by t8_eid) is stale. The CUDA tier's copy-mode
-     * warm start reads every expert through one slot a thread whose eid never changes,
-     * and handed the device the first expert's rows for all of them. */
-    s->t8_eid = 0;
     if (g_gguf) {
         /* three reads, one per fused tensor: expert eid's gate, up, down rows */
         const GqExp *x = &m->gqx[layer]; const int ilv = gguf_expert_ilv(x);
@@ -4529,16 +4176,6 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
          * them, and keeping them would add ~50% to expert-cache RSS on the
          * recommended gs64 container -- so qt_ready() gates the allocation.
          * Under CUDA=0 that is an inline `return 0` and this costs nothing. */
-        if (qt_ready() && qt_experts_on()) {
-            int64_t gp = ng / 2, up = ng / 2, dp = nd / 2;   /* gate/up/down packed sizes */
-            s->g4 = (uint8_t *)malloc((size_t)gp);
-            s->u4 = (uint8_t *)malloc((size_t)up);
-            s->d4 = (uint8_t *)malloc((size_t)dp);
-            if (!s->g4 || !s->u4 || !s->d4) { fprintf(stderr, "OOM int4-packed %s\n", nm); exit(1); }
-            memcpy(s->g4, raw,           (size_t)gp);
-            memcpy(s->u4, raw + gp,      (size_t)up);
-            memcpy(s->d4, raw + gp + up, (size_t)dp);
-        }
     } else {
         s->is_int4 = 0;
         free(s->g4); free(s->u4); free(s->d4); s->g4 = s->u4 = s->d4 = NULL;
@@ -4592,17 +4229,7 @@ static void slot_ensure_int8(Model *m, Slot *s) {
  * 3070, 2,000 re-plan victims cost ~7 ms/token over the next 300 tokens on
  * the miss path and nothing here. */
 static void expert_get(Model *m, int layer, int eid, Slot **out);
-static void tier_rebuild_evicted(Model *m) {
-    if (!qt_ready()) return;
-    int ls[512], es[512];
-    int n = qt_evicted_take(ls, es, 512);
-    if (n <= 0 || xf_mode(m)) return;   /* planar int4 keeps its RAM copy in every slot */
-    #pragma omp parallel for schedule(dynamic, 1)   /* a promotion's few victims a token: every thread one */
-    for (int i = 0; i < n; i++) {
-        Slot *e; expert_get(m, ls[i], es[i], &e);
-        slot_ensure_int8(m, e);
-    }
-}
+static void tier_rebuild_evicted(Model *m) { (void)m; }
 
 /* QT_PREFILL_REPLAN=1: after each prefill layer's routing, hand the tier that
  * layer's counts over the prompt rows (qt_replan), so residents this prompt
@@ -4692,7 +4319,6 @@ static void expert_fetch(Model *m, int layer, int eid, Slot **out, int hold) {
             lru = slot_victim(lc, layer, 1);
         }
         s = &lc->slots[lru]; s->pinned = 0;
-        if (vkt_ram_first(layer, s->eid)) vkt_ram_gave();
     }
     cache_hide(m, layer, s); s->used = ++m->clock;
     pthread_mutex_unlock(&g_pilot_mx);
@@ -5151,65 +4777,7 @@ static void moe_xf_run(Model *m, int layer, const float *x, int S, float *out, c
     free(ex); free(exp); free(ridx); free(rval); free(held); free(scratch);
 }
 
-/* The CUDA tier's CPU share of one token: the routed experts qt_issue left
- * (mask bit clear), each held while the tier sees its bytes and the CPU
- * computes it, val*expert added to os in rank order. Offering the bytes of the
- * expert in hand (tier_offer_slot, whichever format the container packed,
- * #1391) is what lets a tier in copy mode promote it: qt_note copies before it
- * returns. Planar slots run through expert_ffn.h, the token's misses as one
- * xf_moe_add when the layer cache holds them all at once and one at a time
- * otherwise (cap < K: holding a second would evict the first); int8 slots
- * through the int8 path, one at a time. */
 static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, const int *idx, const float *val);
-static void qt_cpu_misses(Model *m, int layer, const float *xs, const int *idx, const float *val,
-                          uint32_t mask, float *os, float *g, float *u, float *hh) {
-    Cfg *c = &m->c; int D = q36_eh(c), K = c->topk, I = c->inter;
-    if (g_gguf) {   /* a GGUF's misses through its own CPU path, each offered to the tier first */
-        int mi[64]; float mv[64];
-        for (int kk = 0; kk < K && kk < 64; kk++) {
-            mi[kk] = idx[kk] >= 0 && !(mask & (1u << kk)) ? idx[kk] : -1; mv[kk] = val[kk];
-            if (mi[kk] >= 0) { Slot *e = expert_hold(m, layer, mi[kk]); tier_offer_slot(m, layer, mi[kk], e); slot_release(e); }
-        }
-        moe_gq_run(m, layer, xs, 1, os, mi, mv);
-        (void)g; (void)u; (void)hh;
-        return;
-    }
-    if (xf_mode(m)) {
-        int per = m->cache[layer].cap >= K ? K : 1;
-        XfExpert ex[32]; const XfExpert *exp[32]; int ridx[32]; float rval[32]; Slot *held[32];
-        void *scratch = malloc(xf_moe_scratch_bytes(1, per, D, I));
-        if (!scratch) { fprintf(stderr, "OOM qt_cpu_misses\n"); exit(1); }
-        for (int k0 = 0; k0 < K; k0 += per) {
-            int n = K - k0 < per ? K - k0 : per, any = 0;
-            for (int j = 0; j < n; j++) {
-                int kk = k0 + j;
-                ridx[j] = -1; rval[j] = 0.f; exp[j] = NULL; held[j] = NULL;
-                if (idx[kk] < 0 || (mask & (1u << kk))) continue;
-                Slot *e = held[j] = expert_hold(m, layer, idx[kk]);
-                tier_offer_slot(m, layer, idx[kk], e);
-                ex[j] = xf_slot_expert(m, e);
-                exp[j] = &ex[j]; ridx[j] = idx[kk]; rval[j] = val[kk]; any = 1;
-            }
-            if (any) xf_moe_add(os, xs, 1, n, D, I, ridx, rval, exp, xf_run_mode(m), scratch);
-            for (int j = 0; j < n; j++) if (held[j]) slot_release(held[j]);
-        }
-        free(scratch);
-        return;
-    }
-    for (int kk = 0; kk < K; kk++) {
-        if (idx[kk] < 0 || (mask & (1u << kk))) continue;
-        Slot *e = expert_hold(m, layer, idx[kk]);
-        slot_ensure_int8(m, e);
-        tier_offer_slot(m, layer, idx[kk], e);
-        matmul_qe(g, xs, e->g, e->gs, D, I);
-        matmul_qe(u, xs, e->u, e->us, D, I);
-        for (int i = 0; i < I; i++) { float gv = g[i]; g[i] = (gv / (1.f + expf(-gv))) * u[i]; }
-        matmul_qd(hh, g, e->d, e->ds, I, D);
-        slot_release(e);
-        float w = val[kk];
-        for (int d = 0; d < D; d++) os[d] += w * hh[d];
-    }
-}
 
 /* ---------- CACHE_ROUTE: residency-aware top-K fill (docs/CACHE_ROUTE.md) ----------
  * The GLM engine's max-rank lever (arXiv:2412.00099) with one more level: an
@@ -5290,7 +4858,6 @@ static void route_select(const float *pr, const uint8_t *keep, int E, int K,
 typedef struct { Model *m; int layer; } RouteCtx;
 static int route_level(void *vctx, int e) {
     RouteCtx *rc = (RouteCtx *)vctx;
-    if (qt_is_resident(rc->layer, e) || vkt_resident(rc->layer, e)) return 2;
     pthread_mutex_lock(&g_pilot_mx);
     Slot *s = slot_indexed(rc->m, rc->layer, e);
     pthread_mutex_unlock(&g_pilot_mx);
@@ -5306,216 +4873,6 @@ static void route_footer(FILE *f, const Model *m) {
     if (m->route.agree_tot)
         fprintf(f, "route_agree %.1f%% | route_kl %.4f\n", 100.0*m->route.agree_hit/m->route.agree_tot,
                 m->route.kl_n ? m->route.kl_sum/(double)m->route.kl_n : 0.0);
-}
-
-/* ---- the Vulkan routed-expert tier (vk_tier.c) ---------------------------------
- * One MoE layer with the tier on, per block of rows: the block's resident experts go
- * to the device as one batch (vkt_issue) and the CPU computes the other (row, rank)
- * pairs into output rows of their own -- the shared kernel's in cache-sized cuts,
- * the int8 slots' one at a time -- and the shared expert into a buffer of its own
- * while the batch runs. Then every rank of every row joins `out` in rank order,
- * the device's and the CPU's alike, and the shared expert after them, as moe()
- * adds them; so the order of the sum never depends on which experts were resident.
- * Every expert the CPU computed passes its RAM bytes to the tier (vkt_note), which
- * may promote it. */
-#define QWEN_VK_ROWS 64
-static void gq_slot_i8(Model *m, int layer, Slot *e) {
-    if (e->t8_eid == e->eid + 1) return;
-    const Cfg *c = &m->c; const GqExp *x = &m->gqx[layer];
-    const int D = q36_eh(c), I = c->inter; const int64_t n = (int64_t)I * D;
-    if (!e->t8) {
-        e->t8 = malloc((size_t)(3 * n)); e->t8s = malloc((size_t)(3 * (n / 32)) * sizeof(float));
-        if (!e->t8 || !e->t8s) { fprintf(stderr, "OOM gq_slot_i8\n"); exit(1); }
-    }
-    gq_rows_i8(x->hg, e->gqe, I, D, x->sg ? x->sg[e->eid] : 1.f, e->t8, e->t8s);
-    gq_rows_i8(x->hu, e->gqe + x->hb_g, I, D, x->su ? x->su[e->eid] : 1.f, e->t8 + n, e->t8s + n / 32);
-    gq_rows_i8(x->hd, e->gqe + x->hb_g + x->hb_u, D, I, x->sd ? x->sd[e->eid] : 1.f, e->t8 + 2 * n, e->t8s + 2 * (n / 32));
-    e->t8_eid = e->eid + 1;
-}
-static int g_vk_gguf_raw;   /* the tier holds the GGUF experts' blocks as the file has them (blockdec.glsl) */
-/* A GGUF expert as the file has it, gate | up | down at 0, eb_g, eb_g + eb_u, for a device
- * that reads the file's rows (the Vulkan tier, the CUDA tier): gqe itself, or when the slot
- * holds the rows interleaved by 16 for the CPU, a copy back in e->t8, made once per expert */
-static const uint8_t *gq_slot_file_rows(Model *m, int layer, Slot *e) {
-    const GqExp *x = &m->gqx[layer];
-    if (!gguf_expert_ilv(x)) return e->gqe;
-    const int D = q36_eh(&m->c), I = m->c.inter;
-    /* the largest layer's: a slot can hold experts of several layers in turn (the CUDA
-     * tier's copy-mode warm start reads every expert through one slot a thread), and a
-     * published file's layers differ in their block types */
-    if (!e->t8 && !(e->t8 = malloc((size_t)m->gqe_max))) { fprintf(stderr, "OOM GGUF expert for the device tier\n"); exit(1); }
-    uint8_t *b = (uint8_t *)e->t8;
-    if (e->t8_eid != e->eid + 1) {
-        const int ft[3] = { x->tg, x->tu, x->td }, ht[3] = { x->hg, x->hu, x->hd }, rows[3] = { I, I, D }, cols[3] = { D, D, I };
-        const int64_t fo[3] = { 0, x->eb_g, x->eb_g + x->eb_u }, ho[3] = { 0, x->hb_g, x->hb_g + x->hb_u }, fb[3] = { x->eb_g, x->eb_u, x->eb_d };
-        for (int k = 0; k < 3; k++) {
-            if (ht[k] != ft[k]) gq_r16_unpack(ht[k], b + fo[k], e->gqe + ho[k], rows[k], cols[k]);
-            else memcpy(b + fo[k], e->gqe + ho[k], (size_t)fb[k]);
-        }
-        e->t8_eid = e->eid + 1;
-    }
-    return b;
-}
-static VktExpertSrc vk_slot_src(Model *m, int layer, Slot *e) {
-    if (g_gguf && g_vk_gguf_raw) {   /* the device reads the file's rows */
-        const GqExp *x = &m->gqx[layer];
-        const uint8_t *b = gq_slot_file_rows(m, layer, e);
-        return (VktExpertSrc){b, b + x->eb_g, b + x->eb_g + x->eb_u, NULL, NULL, NULL};
-    }
-    if (g_gguf) {
-        int64_t n = (int64_t)m->c.inter * q36_eh(&m->c);
-        gq_slot_i8(m, layer, e);
-        return (VktExpertSrc){e->t8, e->t8 + n, e->t8 + 2 * n, e->t8s, e->t8s + n / 32, e->t8s + 2 * (n / 32)};
-    }
-    if (e->pw) {
-        int64_t gp = (int64_t)m->c.inter * q36_eh(&m->c) / 2;
-        if (xf_r16(m)) {   /* the device reads planar rows and scale arrays: back from the groups, once per expert */
-            const int H = q36_eh(&m->c), I = m->c.inter; const int64_t scu = scale_count_gu(&m->c), nsc = 2 * scu + scale_count_d(&m->c);
-            const size_t gu = (size_t)(I / 16) * xf16_group_bytes(H);
-            if (!e->t8 && !(e->t8 = malloc((size_t)(3 * gp)))) { fprintf(stderr, "OOM int4 expert for the Vulkan tier\n"); exit(1); }
-            if (!e->t8s && !(e->t8s = malloc((size_t)nsc * sizeof(float)))) { fprintf(stderr, "OOM int4 expert for the Vulkan tier\n"); exit(1); }
-            uint8_t *b = (uint8_t *)e->t8;
-            if (e->t8_eid != e->eid + 1) {
-                xf16_unpack(b,          e->t8s,           e->pw,          I, H);
-                xf16_unpack(b + gp,     e->t8s + scu,     e->pw + gu,     I, H);
-                xf16_unpack(b + 2 * gp, e->t8s + 2 * scu, e->pw + 2 * gu, H, I);
-                e->t8_eid = e->eid + 1;
-            }
-            return (VktExpertSrc){b, b + gp, b + 2 * gp, e->t8s, e->t8s + scu, e->t8s + 2 * scu};
-        }
-        return (VktExpertSrc){e->pw, e->pw + gp, e->pw + 2 * gp, e->gs, e->us, e->ds};
-    }
-    return (VktExpertSrc){e->g, e->u, e->d, e->gs, e->us, e->ds};
-}
-/* The shared kernel's CPU pairs (want[i] set), into ctb[i]: moe_xf_run's cuts, the
- * held slots released after each. */
-static void moe_vk_xf_cpu(Model *m, int layer, const float *x, int S, const int *idx,
-                          const uint8_t *want, float *ctb) {
-    Cfg *c = &m->c; int D = q36_eh(c), K = c->topk, F = c->inter;
-    int cap = m->cache[layer].cap;
-    int per = cap >= S * K ? S : 1, kper = cap >= K ? K : 1, n = per * kper;
-    XfExpert *ex = malloc(sizeof(XfExpert) * (size_t)n);
-    const XfExpert **exp = malloc(sizeof(XfExpert *) * (size_t)n);
-    int *ridx = malloc(sizeof(int) * (size_t)n); Slot **held = malloc(sizeof(Slot *) * (size_t)n);
-    float *lctb = falloc((int64_t)n * D);
-    void *scratch = malloc(xf_moe_scratch_bytes(per, kper, D, F));
-    if (!ex || !exp || !ridx || !held || !scratch) { fprintf(stderr, "OOM moe_vk_xf_cpu\n"); exit(1); }
-    for (int s0 = 0; s0 < S; s0 += per)
-        for (int k0 = 0; k0 < K; k0 += kper) {
-            int any = 0;
-            for (int s = 0; s < per; s++) for (int k = 0; k < kper; k++) {
-                int src = (s0 + s) * K + (k0 + k), dst = s * kper + k;
-                ridx[dst] = -1; exp[dst] = NULL; held[dst] = NULL;
-                if (idx[src] < 0 || !want[src]) continue;
-                Slot *e = held[dst] = expert_hold(m, layer, idx[src]);
-                ex[dst] = xf_slot_expert(m, e);
-                exp[dst] = &ex[dst]; ridx[dst] = idx[src]; any = 1;
-            }
-            if (any) xf_moe_compute(lctb, x + (int64_t)s0 * D, per, kper, D, F, ridx, exp, xf_run_mode(m), scratch);
-            for (int s = 0; s < per; s++) for (int k = 0; k < kper; k++) {
-                int src = (s0 + s) * K + (k0 + k), dst = s * kper + k;
-                if (!held[dst]) continue;
-                memcpy(ctb + (int64_t)src * D, lctb + (int64_t)dst * D, (size_t)D * sizeof(float));
-                VktExpertSrc vs = vk_slot_src(m, layer, held[dst]); vkt_note(layer, idx[src], &vs);
-                slot_release(held[dst]);
-            }
-        }
-    free(ex); free(exp); free(ridx); free(held); free(lctb); free(scratch);
-}
-/* The int8 slots' CPU pairs (want[i] set), into ctb[i], one at a time. */
-static void moe_vk_i8_cpu(Model *m, int layer, const float *x, int S, const int *idx,
-                          const uint8_t *want, float *ctb, float *g, float *u) {
-    Cfg *c = &m->c; int D = q36_eh(c), K = c->topk, I = c->inter;
-    for (int i = 0; i < S * K; i++) {
-        if (idx[i] < 0 || !want[i]) continue;
-        const float *xs = x + (int64_t)(i / K) * D;
-        Slot *e = expert_hold(m, layer, idx[i]);   /* the PILOT worker may not evict it mid-matmul */
-        slot_ensure_int8(m, e);
-        matmul_qe(g, xs, e->g, e->gs, D, I);
-        matmul_qe(u, xs, e->u, e->us, D, I);
-        for (int j = 0; j < I; j++) { float gv = g[j]; g[j] = (gv / (1.f + expf(-gv))) * u[j]; }
-        matmul_qd(ctb + (int64_t)i * D, g, e->d, e->ds, I, D);
-        VktExpertSrc vs = vk_slot_src(m, layer, e); vkt_note(layer, idx[i], &vs);
-        slot_release(e);
-    }
-}
-/* GGUF mode: the pairs the tier did not take, from the ggml rows as the CPU path reads
- * them; an expert the tier would take now is converted for it (vkt_wants) and noted. */
-static void moe_vk_gq_cpu(Model *m, int layer, const float *x, int S, const int *idx,
-                          const uint8_t *want, float *ctb) {
-    Cfg *c = &m->c; int D = q36_eh(c), K = c->topk, I = c->inter;
-    const GqExp *gx = &m->gqx[layer];
-    float *G = falloc(I), *U = falloc(I);
-    for (int i = 0; i < S * K; i++) {
-        if (idx[i] < 0 || !want[i]) continue;
-        const float *xs = x + (int64_t)(i / K) * D; float *y = ctb + (int64_t)i * D;
-        Slot *e = expert_hold(m, layer, idx[i]);
-        gq_matmul(G, xs, e->gqe, gx->hg, 1, D, I);
-        gq_matmul(U, xs, e->gqe + gx->hb_g, gx->hu, 1, D, I);
-        float sg = gx->sg ? gx->sg[idx[i]] : 1.f, su = gx->su ? gx->su[idx[i]] : 1.f;
-        for (int j = 0; j < I; j++) { float gv = G[j] * sg; G[j] = (gv / (1.f + expf(-gv))) * (U[j] * su); }
-        gq_matmul(y, G, e->gqe + gx->hb_g + gx->hb_u, gx->hd, 1, I, D);
-        if (gx->sd) for (int d = 0; d < D; d++) y[d] *= gx->sd[idx[i]];
-        if (vkt_wants(layer, idx[i])) { VktExpertSrc vs = vk_slot_src(m, layer, e); vkt_note(layer, idx[i], &vs); }
-        slot_release(e);
-    }
-    free(G); free(U);
-}
-static void moe_vk_run(Model *m, Layer *l, int layer, const float *x, int S, float *out,
-                       const int *idx, const float *val, int routed_only) {
-    Cfg *c = &m->c; int D = q36_eh(c), K = c->topk, I = c->inter, SI = routed_only ? 0 : c->shared_inter;
-    int xf = xf_mode(m), B = vkt_step_rows(S, QWEN_VK_ROWS);   /* a whole prompt chunk when the tier streams */
-    float *ctb = falloc((int64_t)B * K * D), *shb = SI > 0 ? falloc((int64_t)B * D) : NULL;
-    float *g = falloc(I > SI ? I : SI), *u = falloc(I > SI ? I : SI), *hh = falloc(D);
-    uint8_t *taken = malloc((size_t)B * K), *want = malloc((size_t)B * K);
-    const float **dev = malloc(sizeof(*dev) * (size_t)B * K);
-    if (!taken || !want || !dev) { fprintf(stderr, "OOM moe_vk_run\n"); exit(1); }
-    for (int s0 = 0; s0 < S; s0 += B) {
-        int rows = S - s0 < B ? S - s0 : B, n = rows * K;
-        const float *xb = x + (int64_t)s0 * D; const int *ib = idx + (int64_t)s0 * K;
-        const float *vb = val + (int64_t)s0 * K;
-        int ndev = vkt_issue(layer, xb, rows, K, ib, taken);
-        for (int i = 0; i < n; i++) { want[i] = !taken[i]; if (taken[i]) ehit_mark(m, layer, ib[i]); }
-        if (g_gguf) moe_vk_gq_cpu(m, layer, xb, rows, ib, want, ctb);
-        else if (xf) moe_vk_xf_cpu(m, layer, xb, rows, ib, want, ctb);
-        else    moe_vk_i8_cpu(m, layer, xb, rows, ib, want, ctb, g, u);
-        if (shb) { memset(shb, 0, (size_t)rows * D * sizeof(float)); qwen_shared_experts_cpu(m, l, xb, rows, shb, g, u, hh); }
-        const float *dsum = NULL;   /* a step wholly on the device: its routed rows summed there */
-        /* Muse Spark normalises every expert's output before the sum: the rows come back apart */
-        if (ndev && !(l->post_en ? vkt_join(dev) : vkt_join_sum(dev, vb, &dsum))) {   /* the batch failed (the tier stops): those pairs here */
-            if (g_gguf) moe_vk_gq_cpu(m, layer, xb, rows, ib, taken, ctb);
-            else if (xf) moe_vk_xf_cpu(m, layer, xb, rows, ib, taken, ctb);
-            else    moe_vk_i8_cpu(m, layer, xb, rows, ib, taken, ctb, g, u);
-            memset(taken, 0, (size_t)n);
-        }
-        /* rows apart (a prompt step reads tens of MB here); each row in rank order */
-        #pragma omp parallel for schedule(static) if (rows >= 64)
-        for (int s = 0; s < rows; s++) {
-            float *os = out + (int64_t)(s0 + s) * D;
-            if (dsum) {   /* the device's sum is this loop's for a zeroed row */
-                const float *ds = dsum + (int64_t)s * D;
-                for (int d = 0; d < D; d++) os[d] += ds[d];
-                if (shb) { const float *sp = shb + (int64_t)s * D; for (int d = 0; d < D; d++) os[d] += sp[d]; }
-                continue;
-            }
-            for (int k = 0; k < K; k++) {
-                int i = s * K + k;
-                if (ib[i] < 0) continue;
-                const float *cp = taken[i] ? dev[i] : ctb + (int64_t)i * D;
-                float w = vb[i];
-                if (l->post_en) {   /* Muse Spark: w * rmsnorm_scaled(cp), the same products in the same order */
-                    const float *ps = l->post_en;
-                    double ms = 0; for (int d = 0; d < D; d++) { double v = (double)cp[d] * ps[d]; ms += v * v; }
-                    const float r = 1.f / sqrtf((float)(ms / D) + c->post_eps);
-                    for (int d = 0; d < D; d++) os[d] += w * (cp[d] * ps[d] * r);
-                    continue;
-                }
-                for (int d = 0; d < D; d++) os[d] += w * cp[d];
-            }
-            if (shb) { const float *sp = shb + (int64_t)s * D; for (int d = 0; d < D; d++) os[d] += sp[d]; }
-        }
-    }
-    free(ctb); free(shb); free(g); free(u); free(hh); free(taken); free(want); free(dev);
 }
 
 /* GGUF mode: the routed experts of S tokens, one expert at a time. Each expert
@@ -5678,29 +5035,12 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out,
      * neither the CUDA tier nor the expert_ffn kernel is consulted.
      * Routing, shared expert, and the combine stay on the CPU below. */
     /* GGUF: the experts as the file stores them, ggml blocks no tier reads (moe_gq_run) */
-    /* Muse Spark's prompt rows go to the CPU's batched path (each expert read once for every row
-     * routed to it): the CUDA chain's frame does not run its experts, and the tier's host step
-     * takes a token at a time */
-    const int qt_rows = qt_ready() && qt_experts_on() && !(c->muse && S >= 16);
-    int use_gq = g_gguf && !vkt_ready() && !qt_rows;   /* the device tiers take a GGUF's experts */
+    int use_gq = g_gguf;
     int use_qq = !use_gq && qq_active();
-    int use_qt = !use_gq && !use_qq && qt_rows;   /* a trunk-only tier leaves the experts to the paths below */
-    /* the Vulkan tier takes the routed experts of every format it was given
-     * (moe_vk_run): the routing is collected first, as for the shared kernel */
-    int use_vk = !use_gq && !use_qq && !use_qt && vkt_ready();
-    int use_xf = !use_gq && !use_qq && !use_qt && !use_vk && xf_mode(m);
-    /* prefill re-plan: this layer's routing counts over the prompt rows */
-    uint32_t *rp_cnt = (use_qt && S > 1 && prefill_replan_on()) ? calloc((size_t)E, sizeof(uint32_t)) : NULL;
-    int *xidx = use_xf || use_vk || use_gq ? malloc(sizeof(int) * (size_t)S * K) : NULL;
-    float *xval = use_xf || use_vk || use_gq ? falloc((int64_t)S * K) : NULL;
-    /* A prompt's routing in parallel (the shared kernel's and the Vulkan tier's, which
-     * collect the routing first): softmax, group-limited top-k and renormalisation per
-     * token are independent, each exactly as the loop below; the momentum logits cross
-     * tokens but never feed the routing, so they go first in token order, and the
-     * bookkeeping (collected experts, frequencies, the tier's history) after, in token
-     * order. Not with cache routing or the agreement meter, whose state crosses tokens.
-     * 1011 tokens of Qwen3.6: about 4 ms a layer on one core. */
-    int par_route = (use_xf || use_vk || use_gq) && S >= 64 && !g_cache_route && !g_route_agree && E <= 1024 && K <= 256 &&
+    int use_xf = !use_gq && !use_qq && xf_mode(m);
+    int *xidx = use_xf || use_gq ? malloc(sizeof(int) * (size_t)S * K) : NULL;
+    float *xval = use_xf || use_gq ? falloc((int64_t)S * K) : NULL;
+    int par_route = (use_xf || use_gq) && S >= 64 && !g_cache_route && !g_route_agree && E <= 1024 && K <= 256 &&
                     !(c->n_group > 1 && c->n_group > E);
     if (par_route) {
         if (m->momentum_logits && m->pilot_smooth > 0.f) {
@@ -5768,7 +5108,6 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out,
                 uint32_t *freq_l = m->freq + (int64_t)layer * E;
                 for (int kk = 0; kk < K; kk++) freq_l[idx[kk]]++;
             }
-            if (use_vk && m->vk_hist) rt_count(layer, idx, K);
         }
     }
     for (int s = par_route ? S : 0; s < S; s++) {
@@ -5852,7 +5191,6 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out,
             uint32_t *freq_l = m->freq + (int64_t)layer * E;
             for (int kk = 0; kk < K; kk++) if (idx[kk] >= 0) freq_l[idx[kk]]++;
         }
-        if (rp_cnt) for (int kk = 0; kk < K; kk++) if (idx[kk] >= 0) rp_cnt[idx[kk]]++;
         const float *xs = x + (int64_t)s*D;
         if (use_qq) {
             /* A failed expert is fatal: once the container owns the routed
@@ -5867,50 +5205,8 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out,
                     exit(1);
                 }
             }
-        } else if (use_xf || use_vk || use_gq) {
+        } else if (use_xf || use_gq) {
             for (int kk = 0; kk < K; kk++) { xidx[s*K+kk] = idx[kk]; xval[s*K+kk] = val[kk]; }
-            if (use_vk && m->vk_hist) rt_count(layer, idx, K);   /* the tier's history (.coli_usage) */
-        } else if (use_qt) {
-            /* CUDA expert tier: run the resident experts as async groups on
-             * all devices, compute the misses on the CPU (overlapped), then
-             * collect the GPU results. The residents go first and are never
-             * read into RAM for it: below full residency the RAM cache and the
-             * VRAM tier then add up instead of holding the same experts. */
-            double _q0 = tm_now();
-            uint32_t qmask = qt_issue(layer, idx, K, xs);
-            double _q1 = tm_now();
-            qt_cpu_misses(m, layer, xs, idx, val, qmask, out + (int64_t)s*D, g, u, hh);
-            /* Compute the shared expert NOW so it overlaps with the GPU
-             * groups; the common block below is skipped. Not for a caller that
-             * wants the routed experts only (the dense chain runs the shared
-             * expert on the device, qwen36_cuda_chain.h). */
-            if (l->sh_I > 0 && !routed_only) {   /* the layer's own width, as the chains and the batch read it */
-                double _ts2 = tm_now();
-                int Ish = l->sh_I;
-                if (!qtd(l->qth_shg, sh, xs, D, Ish))  matmul_d(sh, xs, &l->sh_g, 1, D, Ish);
-                if (!qtd(l->qth_shu, shu, xs, D, Ish)) matmul_d(shu, xs, &l->sh_u, 1, D, Ish);
-                for (int i = 0; i < Ish; i++) { float sv = sh[i]; sh[i] = (sv / (1.f + expf(-sv))) * shu[i]; }
-                if (!qtd(l->qth_shd, shd, sh, Ish, D)) matmul_d(shd, sh, &l->sh_d, 1, Ish, D);
-                float sgate = 1.f;
-                if (l->sh_gate) {
-                    float sg = 0.f; const float *wg = l->sh_gate;
-                    for (int i = 0; i < D; i++) sg += xs[i] * wg[i];
-                    sgate = 1.f / (1.f + expf(-sg));
-                }
-                float *os = out + (int64_t)s*D;
-                for (int d = 0; d < D; d++) os[d] += sgate * shd[d];
-                tm_add(S, 3, tm_now()-_ts2);
-            }
-            double _q2 = tm_now();
-            if(!(l->post_en ? qt_take_scaled(qmask, val, K, out + (int64_t)s*D, l->post_en, c->post_eps)
-                            : qt_take(qmask, val, K, out + (int64_t)s*D))){
-                fprintf(stderr,"qwen36: CUDA expert collection failed at layer %d; stopping inference\n",layer);
-                exit(1);
-            }
-            if (tm_on() && S==1) {
-                extern double g_qt_iss, g_qt_cpu, g_qt_tak;
-                g_qt_iss += _q1-_q0; g_qt_cpu += _q2-_q1; g_qt_tak += tm_now()-_q2;
-            }
         } else {
             for (int kk = 0; kk < K; kk++) {
                 Slot *e = expert_hold(m, layer, idx[kk]);   /* the PILOT worker may not evict it mid-matmul */
@@ -5927,15 +5223,9 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out,
             }
         }
     }
-    if (rp_cnt) { qt_replan(layer, rp_cnt, prefill_replan_cap()); free(rp_cnt); }   /* this layer's swaps upload while the next layers compute */
     if (use_xf) { moe_xf_run(m, layer, x, S, out, xidx, xval); free(xidx); free(xval); }
-    if (use_vk) { moe_vk_run(m, l, layer, x, S, out, xidx, xval, routed_only); free(xidx); free(xval); }
     if (use_gq) { moe_gq_run(m, layer, x, S, out, xidx, xval); free(xidx); free(xval); }
-    /* The CUDA tier keeps its per-token shared block above because it overlaps
-     * resident GPU experts, and the Vulkan tier computes it inside moe_vk_run while
-     * its batch runs.  CPU prefill instead traverses each shared matrix once per
-     * bounded chunk. */
-    if (!use_qt && !use_vk && !routed_only) qwen_shared_experts_cpu(m,l,x,S,out,sh,shu,shd);
+    if (!routed_only) qwen_shared_experts_cpu(m,l,x,S,out,sh,shu,shd);
     free(logits); free(g); free(u); free(hh); free(sh); free(shu); free(shd);
 }
 /* Muse Spark's feed-forward: the router on the hidden width, the experts at theirs
@@ -5981,32 +5271,11 @@ static int dnproj_batch_rows(int S, int H, int O) {
 /* Host/device state hand-over for a DeltaNet layer that runs on the GPU. The
  * host arrays are canonical: the device copy is a cache that is fresh (holds
  * what the host holds) or ahead (host_stale: the device advanced). */
-static void dn_gpu_push(Model *m, int layer) {
-    if (!m->dn_dev_fresh[layer]) {
-        if (qt_dn_gpu_set_state(layer, m->DN_conv[layer], m->DN_rec[layer])) m->dn_dev_fresh[layer] = 1;
-    }
-}
-static void dn_gpu_pull(Model *m, int layer) {
-    if (m->dn_host_stale && m->dn_host_stale[layer]) {
-        if (qt_dn_gpu_get_state(layer, m->DN_conv[layer], m->DN_rec[layer])) m->dn_host_stale[layer] = 0;
-        else fprintf(stderr, "[dn] layer %d: could not read the GPU state back; the CPU continues from a stale copy\n", layer);
-    }
-}
-static void dn_gpu_pull_all(Model *m) {
-    if (!m->dn_dev) return;
-    for (int i = 0; i < m->c.n_layers; i++) if (!m->c.is_attn[i]) dn_gpu_pull(m, i);
-}
-/* the host state was rewritten (reset, restore): the device copy is old */
-static void dn_gpu_invalidate(Model *m) {
-    if (!m->dn_dev_fresh) return;
-    memset(m->dn_dev_fresh, 0, (size_t)m->c.n_layers);
-    memset(m->dn_host_stale, 0, (size_t)m->c.n_layers);
-}
-static int dn_gpu_env_on(void) {
-    static int on = -1;
-    if (on < 0) { const char *p = getenv("Q36_DN_GPU"); on = p && *p == '1'; }
-    return on;
-}
+static void dn_gpu_push(Model *m, int layer) { (void)m; (void)layer; }
+static void dn_gpu_pull(Model *m, int layer) { (void)m; (void)layer; }
+static void dn_gpu_pull_all(Model *m) { (void)m; }
+static void dn_gpu_invalidate(Model *m) { (void)m; }
+static int dn_gpu_env_on(void) { return 0; }
 
 /* LFM3's short gated convolution (HF Lfm3ShortConv): B, C, x = in_proj(x) in three, then
  * out_proj(C * conv(B * x)). The conv is causal and by channel over dn_convk taps,
@@ -6063,7 +5332,7 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
      * The CUDA tier projects qkv ++ z into one interleaved block (qkvz). */
     int proj_dim = conv_dim + value_dim;
     int B = dnproj_batch_rows(S, H, proj_dim);
-    float *qkvz = falloc((int64_t)B * proj_dim);
+    float *qkvz = NULL;
     float *qkvb = falloc((int64_t)B * conv_dim);
     float *zb   = falloc((int64_t)B * value_dim);
     float *bb   = falloc((int64_t)B * vh);
@@ -6089,43 +5358,13 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
      * out_proj -- in one device chain, host in, host out. The state stays on
      * the card; the host copy is refreshed only when something on the CPU
      * asks for it (dn_gpu_pull). */
-    if (S == 1 && m->dn_dev && qt_dn_gpu_ready(layer)) {
-        extern double g_dn_sub[4];
-        double _g0 = tm_now();
-        matmul(bb, x, l->dn_b, 1, H, vh);
-        matmul(ab, x, l->dn_a, 1, H, vh);
-        for (int h = 0; h < vh; h++) {
-            beta[h] = 1.f / (1.f + expf(-bb[h]));
-            gg[h] = expf(-expf(l->dn_alog[h]) * softplus_f(ab[h] + l->dn_dtbias[h]));   /* egh */
-        }
-        dn_gpu_push(m, layer);
-        int ok = m->dn_dev_fresh[layer] && qt_dn_gpu_step(layer, x, out, gg, beta);
-        if (ok) {
-            m->dn_host_stale[layer] = 1;
-            if (tm_on()) g_dn_sub[0] += tm_now() - _g0;
-            if (dbg) fclose(dbg);
-            free(qkvz); free(qkvb); free(zb); free(bb); free(ab); free(outrb);
-            free(beta); free(gg);
-            free(conv_out); free(q); free(k); free(outv); free(kv); free(delta);
-            return;
-        }
-        /* the tier turned the layer off: continue on the CPU from the state
-         * the card still holds (a failed step may or may not have advanced it) */
-        dn_gpu_pull(m, layer);
-    } else if (m->dn_dev) {
-        dn_gpu_pull(m, layer);              /* prefill or a CPU-only layer: the host must be current */
-    }
-
     for (int base = 0; base < S; base += B) {
         int rows = S - base < B ? S - base : B;
         const float *xb = x + (int64_t)base * H;
         extern double g_dn_sub[4];
         double _d0 = tm_now();
-        int gpu_block = qt_dnproj_ready(layer) && qt_dnproj_matmul_batch(layer, qkvz, xb, rows, H, proj_dim);
-        if (!gpu_block) {
-            matmul_d(qkvb, xb, &l->dn_qkv, rows, H, conv_dim);
-            matmul_d(zb,   xb, &l->dn_z,   rows, H, value_dim);
-        }
+        matmul_d(qkvb, xb, &l->dn_qkv, rows, H, conv_dim);
+        matmul_d(zb,   xb, &l->dn_z,   rows, H, value_dim);
         matmul(bb, xb, l->dn_b, rows, H, vh);
         matmul(ab, xb, l->dn_a, rows, H, vh);
         if (tm_on() && S==1){ double t=tm_now(); g_dn_sub[0]+=t-_d0; _d0=t; }
@@ -6142,7 +5381,7 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
                 const float *w = l->dn_conv + (int64_t)cc * convk;
                 float *rg = ring + (int64_t)cc * (convk - 1);
                 for (int r = 0; r < rows; r++) {
-                    const float *qkv = gpu_block ? qkvz + (int64_t)r * proj_dim : qkvb + (int64_t)r * conv_dim;
+                    const float *qkv = qkvb + (int64_t)r * conv_dim;
                     float acc = 0.f;
                     for (int kk = 0; kk < convk - 1; kk++) acc += w[kk] * rg[kk];
                     acc += w[convk - 1] * qkv[cc];
@@ -6182,7 +5421,7 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
                         float kkd = kh[kk], qkd = qh[kk]; float *Sr = Sh + (int64_t)kk * vdim;
                         for (int vv = 0; vv < vdim; vv++) { Sr[vv] += kkd * dl[vv]; ov[vv] += qkd * Sr[vv]; }
                     }
-                    const float *zr = (gpu_block ? qkvz + (int64_t)r * proj_dim + conv_dim : zb + (int64_t)r * value_dim) + (int64_t)h * vdim;
+                    const float *zr = zb + (int64_t)r * value_dim + (int64_t)h * vdim;
                     const float *w = l->dn_norm;
                     double ms = 0; for (int d = 0; d < vdim; d++) ms += (double)ov[d] * ov[d];
                     float rr = 1.f / sqrtf((float)(ms / vdim) + c->eps);
@@ -6197,8 +5436,8 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
         } else
         for (int r = 0; r < rows; r++) {
         if (m->mux_rows) { rec = m->mux_rows[base + r].seq->DN_rec[layer]; ring = m->mux_rows[base + r].seq->DN_conv[layer]; }
-        const float *qkv = gpu_block ? qkvz + (int64_t)r * proj_dim : qkvb + (int64_t)r * conv_dim;
-        const float *z = gpu_block ? qkv + conv_dim : zb + (int64_t)r * value_dim;
+        const float *qkv = qkvb + (int64_t)r * conv_dim;
+        const float *z = zb + (int64_t)r * value_dim;
         const float *b = bb + (int64_t)r * vh, *a = ab + (int64_t)r * vh;
         float *outr = outrb + (int64_t)r * value_dim;
         for (int h = 0; h < vh; h++) {
@@ -6310,9 +5549,7 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
         }
         }
         float *ob = out + (int64_t)base * H;
-        if (rows == 1 ? !qtd(l->qth_dnout, ob, outrb, value_dim, H)
-                      : !qtd_batch(l->qth_dnout, ob, outrb, rows, value_dim, H))
-            matmul_d(ob, outrb, &l->dn_out, rows, value_dim, H);
+        matmul_d(ob, outrb, &l->dn_out, rows, value_dim, H);
         if (tm_on() && S==1){ g_dn_sub[3]+=tm_now()-_d0; }
         if (dbg && base == 0) {       /* ... its out_proj row and gates, then done */
             fwrite(ob, sizeof(float), H, dbg);
@@ -6331,149 +5568,7 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
     free(conv_out); free(q); free(k); free(outv); free(kv); free(delta);
 }
 
-/* The rest of the dense trunk, offered to the placer by name and layer with
- * the bytes of the dense-i8 copies (docs/qwen36-cuda-tier.md, "Placement"):
- *   dnout    -- the DeltaNet out_proj, one matrix per DeltaNet layer
- *   attnproj -- q, k, v, o of every attention layer, offered as one item
- *   shexp    -- gate, up, down of the shared expert, every layer
- * Measured on ds (CPU, 8 threads): of the 37.5 ms a DeltaNet layer stack
- * costs per decoded token, 23.4 are the input projections (already placeable
- * as "dnproj"), 8.3 the out_proj and norm, 3.3 the convolution and 2.4 the
- * recurrence -- the matmuls are the cost, not the recurrence, so this is
- * where the trunk goes. Offer order after lmhead and dnproj: dnout, attnproj,
- * shexp, each in layer order, so a partial placement is whole layers. A
- * component is offered only when every matrix of it has a dense-i8 copy. */
-static void trunk_offer_dense(Model *m){
-    Cfg *c = &m->c;
-    for (int i = 0; i < c->n_layers; i++) {
-        if (c->is_attn[i]) continue;
-        /* LFM3: a conv layer's two projections, its non-attention work */
-        size_t b = c->lfm3 ? qdw_bytes(&m->L[i].sc_in) + qdw_bytes(&m->L[i].sc_out) : qdw_bytes(&m->L[i].dn_out);
-        if (b) qt_trunk_offer("dnout", i, b);
-    }
-    for (int i = 0; i < c->n_layers; i++) {
-        if (!c->is_attn[i]) continue;
-        Layer *l = &m->L[i];
-        size_t bq = qdw_bytes(&l->q), bk = qdw_bytes(&l->k), bv = qdw_bytes(&l->v), bo = qdw_bytes(&l->o);
-        if (bq && bk && bv && bo) qt_trunk_offer("attnproj", i, bq + bk + bv + bo + qdw_bytes(&l->ag));
-    }
-    /* The shared expert is offered only on request (Q36_OFFER_SHEXP=1). On the
-     * card it is 120 synchronous small GEMVs per token that sit between
-     * qt_issue and qt_take, where on the CPU it hides behind the expert group:
-     * measured on the 35B, 3070, shared 3.7-4.0 ms/token on the CPU against
-     * 6.3 on the same card and 11-12.7 with layers on a slower second card
-     * (docs/qwen36-cuda-tier.md). A hand-written COLI_PLACE naming shexp is
-     * still obeyed when the offer is made. */
-    { const char *so = getenv("Q36_OFFER_SHEXP"), *cc = getenv("COLI_CUDA_CHAIN");   /* the chain runs it on the device, beside the host's experts */
-      if ((so && *so == '1') || !(cc && *cc == '0'))
-        for (int i = 0; i < c->n_layers; i++) {
-            Layer *l = &m->L[i];
-            size_t bg = qdw_bytes(&l->sh_g), bu = qdw_bytes(&l->sh_u), bd = qdw_bytes(&l->sh_d);
-            if (bg && bu && bd) qt_trunk_offer("shexp", i, bg + bu + bd);
-        } }
-    /* Muse Spark's projections to and from the experts' width, under "shexp": the dense
-     * work beside the routed experts (no shared expert there) */
-    for (int i = 0; c->muse && i < c->n_layers; i++) {
-        size_t bd = qdw_bytes(&m->L[i].lat_d), bu = qdw_bytes(&m->L[i].lat_u);
-        if (bd && bu) qt_trunk_offer("shexp", i, bd + bu);
-    }
-}
-/* After qt_init decided: upload what was placed, keep the handles in the
- * Layer. Every matrix falls back on its own, so a failed upload costs one
- * GEMV on the CPU, never the component. Returns the number of matrices
- * placed; `vram_bytes` gets their size. */
-static int trunk_place_dense(Model *m, double *vram_bytes, int kinds[3]){
-    Cfg *c = &m->c; int placed = 0; double vram = 0;
-    kinds[0] = kinds[1] = kinds[2] = 0;   /* dnout, attnproj, shexp: the line says which went up */
-    for (int i = 0; i < c->n_layers; i++) {
-        Layer *l = &m->L[i];
-        if (!c->is_attn[i] && c->lfm3) {
-            int dev = qt_place_of("dnout", i);
-            l->qth_scin = qdw_place(&l->sc_in, dev); l->qth_scout = qdw_place(&l->sc_out, dev);
-            if (l->qth_scin) { placed++; kinds[0]++; vram += (double)qdw_bytes(&l->sc_in); }
-            if (l->qth_scout) { placed++; kinds[0]++; vram += (double)qdw_bytes(&l->sc_out); }
-        } else if (!c->is_attn[i]) {
-            l->qth_dnout = qdw_place(&l->dn_out, qt_place_of("dnout", i));
-            if (l->qth_dnout) { placed++; kinds[0]++; vram += (double)qdw_bytes(&l->dn_out); }
-        } else {
-            int dev = qt_place_of("attnproj", i);
-            l->qth_q = qdw_place(&l->q, dev); l->qth_k = qdw_place(&l->k, dev);
-            l->qth_v = qdw_place(&l->v, dev); l->qth_o = qdw_place(&l->o, dev);
-            if (l->qth_q) { placed++; kinds[1]++; vram += (double)qdw_bytes(&l->q); }
-            if (l->qth_k) { placed++; kinds[1]++; vram += (double)qdw_bytes(&l->k); }
-            if (l->qth_v) { placed++; kinds[1]++; vram += (double)qdw_bytes(&l->v); }
-            if (l->qth_o) { placed++; kinds[1]++; vram += (double)qdw_bytes(&l->o); }
-            if (l->ag.O && (l->qth_ag = qdw_place(&l->ag, dev))) { placed++; kinds[1]++; vram += (double)qdw_bytes(&l->ag); }
-        }
-        int dev = qt_place_of("shexp", i);
-        l->qth_shg = qdw_place(&l->sh_g, dev); l->qth_shu = qdw_place(&l->sh_u, dev); l->qth_shd = qdw_place(&l->sh_d, dev);
-        if (l->qth_shg) { placed++; kinds[2]++; vram += (double)qdw_bytes(&l->sh_g); }
-        if (l->qth_shu) { placed++; kinds[2]++; vram += (double)qdw_bytes(&l->sh_u); }
-        if (l->qth_shd) { placed++; kinds[2]++; vram += (double)qdw_bytes(&l->sh_d); }
-        if (l->lat_d.O && (l->qth_ld = qdw_place(&l->lat_d, dev))) { placed++; kinds[2]++; vram += (double)qdw_bytes(&l->lat_d); }
-        if (l->lat_u.O && (l->qth_lu = qdw_place(&l->lat_u, dev))) { placed++; kinds[2]++; vram += (double)qdw_bytes(&l->lat_u); }
-    }
-    if (vram_bytes) *vram_bytes = vram;
-    return placed;
-}
 
-/* Measured, not assumed. The placer prices a trunk component by the bytes it
- * saves on the CPU's memory bus, which presumes the GPU answers a GEMV faster
- * than the CPU does. Four Tesla M10 (sm_50) said otherwise: every placed
- * component ran slower there, lm_head 68.8 ms against 41.7 on the CPU, and
- * decode fell from 3.56 to 2.68 tok/s (#1652). So before any trunk upload,
- * one DeltaNet input projection (the most numerous placed matrix) is timed
- * both ways on the device that would host it, ten GEMVs each, best of three
- * rounds after a warm-up, and the trunk goes to VRAM only if the GPU wins.
- * The CPU's ten GEMVs read ten layers' projections, not one ten times: one
- * 16 MiB projection (the 35B's) stays in a big L3 after the first GEMV, while
- * decode reads each projection once a step, from RAM. Beside an RTX PRO 6000
- * an EPYC 9B45 (three 32 MiB L3s) timed the one matrix at 0.050-0.051 ms
- * against the card's 0.045-0.046; under nsys the two tied and the trunk and
- * the experts went to the CPU: decode 21.5 tok/s, 113 on the card.
- * Only the automatic placement is questioned: a hand-written COLI_PLACE
- * stands. COLI_TRUNK_PROBE=0 skips the probe and trusts the placer. The
- * probe's copy stays resident (one projection, 16 MiB on the 35B). */
-static int trunk_probe_gpu_wins(Model *m){
-    const char *e = getenv("COLI_TRUNK_PROBE");
-    if (e && *e == '0') return 1;
-    if (!qt_place_is_auto()) return 1;
-    Cfg *c = &m->c;
-    QW *w = NULL, *cw[10]; int dev = QT_PLACE_CPU, nc = 0;
-    for (int i = 0; i < c->n_layers && nc < 10; i++) {
-        if (c->is_attn[i] || !m->L[i].dn_qkv.q) continue;
-        if (!w) { w = &m->L[i].dn_qkv; dev = qt_place_of("dnproj", i); }
-        if (m->L[i].dn_qkv.I == w->I && m->L[i].dn_qkv.O == w->O) cw[nc++] = &m->L[i].dn_qkv;
-    }
-    if (!w) return 1;                                /* dense-i8 off: nothing will be placed */
-    if (dev == QT_PLACE_CPU) dev = qt_place_of("lmhead", 0);
-    if (dev == QT_PLACE_CPU) return 1;               /* nothing placed: nothing to measure */
-    int I = w->I, O = w->O;
-    int h = qt_dense_init(w->q, w->sc, I, O, dev);
-    if (h < 0) return 1;                             /* cannot measure: the placer's word stands */
-    float *x = malloc((size_t)I * sizeof(float)), *y = malloc((size_t)O * sizeof(float));
-    if (!x || !y) { free(x); free(y); return 1; }
-    for (int i = 0; i < I; i++) x[i] = sinf(0.37f * (float)i);
-    double gpu = 1e30, cpu = 1e30;
-    for (int r = 0; r < 3; r++) {
-        for (int k = 0; k < 3; k++) if (!qt_dense_matmul(h, y, x, I, O)) { free(x); free(y); return 1; }
-        double t0 = now_s();
-        for (int k = 0; k < 10; k++) if (!qt_dense_matmul(h, y, x, I, O)) { free(x); free(y); return 1; }
-        double tg = (now_s() - t0) / 10;
-        /* with ten, the warm-up takes the last three, so the timed ten do not start in the cache it filled */
-        for (int k = 0; k < 3; k++) matmul_q(y, x, cw[(7 + k) % nc]->q, cw[(7 + k) % nc]->sc, I, O);
-        t0 = now_s();
-        for (int k = 0; k < 10; k++) matmul_q(y, x, cw[k % nc]->q, cw[k % nc]->sc, I, O);
-        double tc = (now_s() - t0) / 10;
-        if (tg < gpu) gpu = tg;
-        if (tc < cpu) cpu = tc;
-    }
-    free(x); free(y);
-    int wins = gpu < cpu;
-    fprintf(stderr, "[place] probe: one [%d x %d] int8 GEMV takes %.3f ms on CUDA dev %d, %.3f ms on the CPU -> trunk %s\n",
-            O, I, gpu * 1e3, dev, cpu * 1e3, wins ? "to VRAM" : "stays on the CPU");
-    return wins;
-}
 
 /* Only single-slot serve prefill supplies a control callback. Other
  * forwards, including decode, speculation and Segment, never read stdin. */
@@ -6592,25 +5687,13 @@ static void serve_echo(const char *id, int pos, int token, const float *lo, int 
 static float *g_hidden_sink = NULL;
 
 static void q36_seq_swap(Model *m, Q36Seq *q);   /* below: a chain swaps a conversation in to rebuild it */
-#ifdef COLI_VULKAN
-#include "qwen36_chain.h"  /* COLI_VK_CHAIN: every layer's dense chain on the device */
-#endif
 static void q36_embed_row(Model *m, int id, int pos, float *row);
 static int q36_cuda_tier_drafts(Model *m);   /* the CUDA tier whole, run by the CUDA chain */
+static inline int qt_ready(void) { return 0; }
 #include "qwen36_mtp.h"    /* Q36_MTP: the MTP head drafts for the speculative step */
 static void q36_mtp_lm_head(Model *m, const float *row, float *logits) {
     Cfg *c = &m->c;
-#ifdef COLI_VULKAN
-    /* the chain's lm_head on the device: one small frame */
-    Q36Chain *ch = (Q36Chain *)m->vkchain;
-    if (g_vk_chain && ch && ch->ok && !ch->failed && ch->head && ch->fin && ch->outd &&
-        vkc_begin() && vkc_write(ch->fin, 0, row, (size_t)c->hidden * sizeof(float)) &&
-        vkc_matmul(vk_qw_tensor(&m->lm_head), ch->fin, 0, ch->outd, 0, 1) && vkc_submit(1)) {
-        memcpy(logits, vkc_ptr(ch->outd), (size_t)c->vocab * sizeof(float));
-        return;
-    }
-#endif
-    if (!qt_lmhead_matmul(logits, row, c->hidden, c->vocab)) matmul_d(logits, row, &m->lm_head, 1, c->hidden, c->vocab);
+    matmul_d(logits, row, &m->lm_head, 1, c->hidden, c->vocab);
 }
 /* The scores of the lm_head rows ids[0..n) on one normed row, on the host: the MTP head's draft
  * list (Q36_MTP_VOCAB). Without host rows, the whole vocabulary and then the listed ids. */
@@ -6658,40 +5741,10 @@ static void q36_embed_row(Model *m, int id, int pos, float *row) {
     if (m->c.muse && !(vrow >= 0 && vrow < m->vis_rows_n)) rmsnorm_plain(row, row, D, m->c.eps);   /* Muse Spark: the token's row normalised */
 }
 
-#ifdef COLI_CUDA
-#include "qwen36_cuda_chain.h"  /* COLI_CUDA_CHAIN: every layer's dense chain on the CUDA device */
-/* The CUDA chain's prompt staging (q36cc_gguf_stage_bytes), out of the tier's expert budget when
- * the card holds fewer than every routed expert of a GGUF (qt_reserve_short): taken from the
- * mirrors' room instead, a 16K prompt on Flint (RTX PRO 4000) found no memory for the routed
- * experts' buffers and took the host's step from then on. COLI_CUDA_HOST_POOL=0: none. */
-static void q36_gguf_stage_reserve(Model *m) {
-    const char *e = getenv("COLI_CUDA_HOST_POOL");
-    size_t st = g_gguf && !(e && *e == '0') ? q36cc_gguf_stage_bytes(m) : 0, routed = 0;
-    for (int i = 0; i < m->c.n_layers; i++) routed += !q36_dense_l(&m->c, i);
-    if (st) qt_reserve_short(st, routed * (size_t)m->c.n_experts);
-}
-#endif
-
-/* The CUDA tier with every routed expert on the device, run by the CUDA chain: what a step
- * computes no longer depends on what is resident, so a verify's rows get a decode step's
- * bits and the speculative step runs as on the Vulkan chain. A tier holding part of the
- * experts (the rest on the CPU, residency following the routed rows, rejected drafts'
- * too) keeps it off. */
 static int q36_cuda_tier_drafts(Model *m) {
-#ifdef COLI_CUDA
-    if (!qt_ready() || !g_cuda_chain || m->dn_dev) return 0;
-    for (int i = 0; i < m->c.n_layers; i++)
-        for (int e = 0; e < m->c.n_experts && !q36_dense_l(&m->c, i); e++)   /* Flint's dense layers hold none */
-            if (!qt_is_resident(i, e)) return 0;
-    return 1;
-#else
     (void)m;
     return 0;
-#endif
 }
-#ifdef COLI_CUDA
-#include "qwen36_mtp_cuda.h"   /* Q36_MTP: the head on the CUDA chain's device */
-#endif
 
 /* The forward: ids[0..S) at pos_base through every layer, the final norm and
  * lm_head on the last `nlogits` rows (one for a step, every row of a speculative
@@ -6733,54 +5786,6 @@ static float *step_ex_control(Model *m, const int *ids, int S, int pos_base, int
     float *chain_logit = NULL;   /* the Vulkan or the CUDA chain ran the final norm and lm_head */
     int stopped = 0;   /* a chain saw the prompt's control between two chunks */
     (void)chain_logit; (void)stopped;
-#ifdef COLI_VULKAN
-    /* COLI_VK_CHAIN: the layers, the final norm and lm_head on the device; x comes
-     * back only when the prefill read-out below needs every row. A partial chain
-     * brings back every row's residual after its layers: the CPU continues from there. */
-    if (g_vk_chain) {
-        int echo = 0, rows_only = 0;
-#ifndef QWEN36_NO_MAIN
-        echo = g_echo_k > 0 && g_echo_id && S > 1;
-#endif
-        if (g_hidden_sink || g_q36_mtp.on) echo = 1;   /* the head reads every row */
-        chain_logit = falloc((int64_t)nlogits * c->vocab);
-        g_q36_ctl = control;
-        chain_n = q36c_forward(m, x, S, pos_base, lf, echo, nlogits, chain_logit, &rows_only);
-        g_q36_ctl = NULL;
-        if (!chain_n && control && control->result) {   /* stopped between two prompt chunks */
-            free(chain_logit); chain_logit = NULL; stopped = 1;
-        } else if (!chain_n) {
-            free(chain_logit); chain_logit = NULL;
-            q36c_cpu_step(m, pos_base);
-            /* Earlier chunks may have returned their final rows for Clef or
-             * prompt logprobs. A failed forward replays every row on the CPU. */
-            for (int s = 0; s < S; s++)
-                q36_embed_row(m, ids[s], pos_base + s, x + (int64_t)s*D);
-        } else if (rows_only) { free(chain_logit); chain_logit = NULL; }
-    }
-#endif
-#ifdef COLI_CUDA
-    /* COLI_CUDA_CHAIN: the same on the CUDA device (qwen36_cuda_chain.h), every layer */
-    if (g_cuda_chain && !chain_logit && !stopped) {
-        int echo = 0, rows_only = 0;
-#ifndef QWEN36_NO_MAIN
-        echo = g_echo_k > 0 && g_echo_id && S > 1;
-#endif
-        if (g_hidden_sink || g_q36_mtp.on) echo = 1;   /* the head reads every row */
-        chain_logit = falloc((int64_t)nlogits * c->vocab);
-        g_q36_ctl = control;
-        chain_n = q36cc_forward(m, x, S, pos_base, lf, echo, nlogits, chain_logit, &rows_only);
-        g_q36_ctl = NULL;
-        if (!chain_n && control && control->result) {
-            free(chain_logit); chain_logit = NULL; stopped = 1;
-        } else if (!chain_n) {
-            free(chain_logit); chain_logit = NULL;
-            q36cc_cpu_step(m, pos_base);
-            for (int s = 0; s < S; s++)
-                q36_embed_row(m, ids[s], pos_base + s, x + (int64_t)s*D);
-        } else if (rows_only) { free(chain_logit); chain_logit = NULL; }
-    }
-#endif
     if (stopped || (!chain_logit && layers_forward_control(m, x, S, pos_base, chain_n,
                                                            c->n_layers, 1, lf, control))) {
         /* Some layers (or a chain's first chunks) may have advanced, others not. Neither
@@ -6830,8 +5835,7 @@ static float *step_ex_control(Model *m, const int *ids, int S, int pos_base, int
             serve_echo(g_echo_id, pos_base, ids[0], NULL, c->vocab, 0);
         for (int p = 0; p + 1 < S; p++) {
             rmsnorm_row(erow, x + (int64_t)p*D, m->final_norm, D, c->eps);
-            if (!qt_lmhead_matmul(elog, erow, D, c->vocab))
-                matmul_d(elog, erow, &m->lm_head, 1, D, c->vocab);
+            matmul_d(elog, erow, &m->lm_head, 1, D, c->vocab);
             q36_logits_out(c, elog, c->vocab);
             serve_echo(g_echo_id, pos_base + p + 1, ids[p+1], elog, c->vocab, g_echo_k);
         }
@@ -6848,8 +5852,7 @@ static float *step_ex_control(Model *m, const int *ids, int S, int pos_base, int
     for (int r = 0; r < nlogits; r++) {
         float *lr = logit + (int64_t)r * c->vocab;
         rmsnorm_row(last, x + (int64_t)(S - nlogits + r)*D, m->final_norm, D, c->eps);
-        if (!qt_lmhead_matmul(lr, last, D, c->vocab))
-            matmul_d(lr, last, &m->lm_head, 1, D, c->vocab);
+        matmul_d(lr, last, &m->lm_head, 1, D, c->vocab);
     }
     q36_logits_out(c, logit, (int64_t)nlogits * c->vocab);   /* the chain's too */
     if (tm_on()) { tm_add(S, 5, tm_now()-_th); if (S==1) g_tm_dec_tokens++; else g_tm_pre_tokens += S; }
@@ -6950,30 +5953,10 @@ static float *q36_step_rows(Model *m, const Q36Row *rows, const int *ids, int S)
     }
     tier_rebuild_evicted(m);
     float *chain_logit = NULL;
-#ifdef COLI_VULKAN
-    /* the Vulkan chain, each row's attention and DeltaNet on its conversation's state on the
-     * device (q36c_mux_step); else the host's path, every row's state on the host first */
-    if (g_vk_chain) {
-        chain_logit = falloc((int64_t)S * c->vocab);
-        if (!q36c_mux_step(m, rows, S, x, chain_logit)) { free(chain_logit); chain_logit = NULL; q36c_mux_host(m, rows, S, 0); }
-    }
-#endif
-#ifdef COLI_CUDA
-    if (!chain_logit && g_cuda_chain) {   /* the same on the CUDA chain */
-        chain_logit = falloc((int64_t)S * c->vocab);
-        if (!q36cc_mux_step(m, rows, S, x, chain_logit)) { free(chain_logit); chain_logit = NULL; q36cc_mux_host(m, rows, S, 0); }
-    }
-#endif
     if (!chain_logit) {
         m->mux_rows = rows;
         layers_forward_range(m, x, S, 0, 0, c->n_layers, 1, NULL);
         m->mux_rows = NULL;
-#ifdef COLI_VULKAN
-        if (g_vk_chain) q36c_mux_host(m, rows, S, 1);
-#endif
-#ifdef COLI_CUDA
-        if (m->cchain) q36cc_mux_host(m, rows, S, 1);
-#endif
     }
     for (int s = 0; s < S; s++) {
         Q36Seq *q = rows[s].seq;
@@ -6990,11 +5973,7 @@ static float *q36_step_rows(Model *m, const Q36Row *rows, const int *ids, int S)
     float *last = falloc((int64_t)S*D), *logit = falloc((int64_t)S * c->vocab);
     double _th = tm_now();
     for (int s = 0; s < S; s++) rmsnorm_row(last + (int64_t)s*D, x + (int64_t)s*D, m->final_norm, D, c->eps);
-    /* the head once for every row; the CUDA tier's copy answers a row at a time */
-    int on_card = 1;
-    for (int s = 0; s < S && on_card; s++)
-        on_card = qt_lmhead_matmul(logit + (int64_t)s * c->vocab, last + (int64_t)s*D, D, c->vocab);
-    if (!on_card) matmul_d(logit, last, &m->lm_head, S, D, c->vocab);
+    matmul_d(logit, last, &m->lm_head, S, D, c->vocab);
     q36_logits_out(c, logit, (int64_t)S * c->vocab);
     if (tm_on()) { tm_add(S, 5, tm_now()-_th); g_tm_dec_tokens += S; }
     free(x); free(last);
@@ -7012,7 +5991,6 @@ static void pilot_realload(Model *m, int layer, int eid) {
         int lru = slot_victim(lc, layer, 0);
         if (lru < 0) { m->is_queued[layer*c->n_experts+eid]=0; pthread_mutex_unlock(&g_pilot_mx); return; }
         s = &lc->slots[lru]; s->pinned = 0;
-        if (vkt_ram_first(layer, s->eid)) vkt_ram_gave();
     }
     cache_hide(m, layer, s); s->used = ++m->clock;
     pthread_mutex_unlock(&g_pilot_mx);
@@ -7077,22 +6055,10 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S) {
             if (idx[b] >= 0 && (idx[a] < 0 || idx[a] > idx[b])) { int t = idx[a]; idx[a] = idx[b]; idx[b] = t; }
         for (int kk = 0; kk < cand; kk++) {
             int eid = idx[kk]; if (eid < 0) continue;
-            int found = 0, fz = -1; pthread_mutex_lock(&g_pilot_mx); LCache *lc = &m->cache[lnext];
+            int found = 0; pthread_mutex_lock(&g_pilot_mx);
             Slot *resident = slot_indexed(m, lnext, eid);
-            if (resident) { found = 1; fz = (int)(resident - lc->slots); }
+            if (resident) found = 1;
             pthread_mutex_unlock(&g_pilot_mx);
-            /* Lookahead: RAM-resident layer-L+1 candidates go to VRAM asynchronously.
-             * Not in copy mode: the slot is not held here, and a recycled slot
-             * would hand the tier another expert's bytes under this one's id. */
-            if (found && fz >= 0 && qt_ready() && !qt_streaming()) {
-                Slot *ps = &lc->slots[fz];
-                /* Same int8 container case as the resident offer in moe():
-                 * on an int8 container ps->g4 is NULL and the prefetch offer
-                 * never fired (#1391). tier_offer_slot handles both formats. */
-                if (!g_gguf) tier_offer_slot(m, lnext, eid, ps);   /* a GGUF's would write the slot's file rows unheld */
-            }
-            if (!found && vkt_ram_first(lnext, eid)) found = 1;   /* the device serves it: nothing to read */
-            if (!found && qt_is_resident(lnext, eid)) found = 1;  /* the CUDA tier's too */
             if (!found) {
                 int gidx = lnext*E + eid;
                 pthread_mutex_lock(&g_pilot_mx); int already_queued = m->is_queued[gidx];
@@ -7135,12 +6101,6 @@ static void pin_drop(void){
 
 static Q36PinState *q36_pin_state_save(Model *m, Q36PinState *reuse){
     Cfg *c = &m->c;
-#ifdef COLI_VULKAN
-    q36c_sync_host(m);   /* the dense chain keeps the newest state on the device */
-#endif
-#ifdef COLI_CUDA
-    q36cc_sync_host(m);
-#endif
     size_t nr = q36_rec_cells(c);
     size_t nc = (size_t)c->dn_conv_dim * (c->dn_convk - 1);
     Q36PinState *st = reuse;
@@ -7198,12 +6158,6 @@ static void q36_pin_state_put(Model *m, const Q36PinState *st){
         if (m->DN_rec[i]  && st->rec[i])  memcpy(m->DN_rec[i],  st->rec[i],  nr * sizeof(float));
         if (m->DN_conv[i] && st->conv[i]) memcpy(m->DN_conv[i], st->conv[i], nc * sizeof(float));
     }
-#ifdef COLI_VULKAN
-    q36c_host_wrote(m, 0);   /* the device's copy goes up again before the next chain step */
-#endif
-#ifdef COLI_CUDA
-    q36cc_host_wrote(m, 0);
-#endif
     dn_gpu_invalidate(m);   /* restored on the host: the card's copy is from another prompt */
     if (g_q36_mtp.on) {
         g_q36_mtp.has_pend = st->mtp_valid;
@@ -7258,12 +6212,6 @@ static void reset_recurrent(Model *m){
         if (m->DN_rec[i])  memset(m->DN_rec[i],  0, q36_rec_cells(c) * sizeof(float));
         if (m->DN_conv[i]) memset(m->DN_conv[i], 0, (size_t)c->dn_conv_dim * (c->dn_convk - 1) * sizeof(float));
     }
-#ifdef COLI_VULKAN
-    q36c_host_wrote(m, 1);   /* zeros: the dense chain fills its copy with zeros */
-#endif
-#ifdef COLI_CUDA
-    q36cc_host_wrote(m, 1);
-#endif
     dn_gpu_invalidate(m);   /* zero on the host is the truth now; the card re-loads it before its next step */
 }
 
@@ -7301,12 +6249,6 @@ static void q36_park_free(Model *m) {
     free(g_q36_park.K); free(g_q36_park.V); free(g_q36_park.mk); free(g_q36_park.mv);
     free(g_q36_park.fed); free(g_q36_park.ring_pos);
     q36_pin_state_free(g_q36_park.st);
-#ifdef COLI_VULKAN
-    q36_mg_park(m, 0, -1);
-#endif
-#ifdef COLI_CUDA
-    q36_mc_park(m, 0, -1);
-#endif
     memset(&g_q36_park, 0, sizeof g_q36_park);
 }
 /* rows [0, r) of a K or V cache of `rows` rows a head, head by head, between it and a copy */
@@ -7353,12 +6295,6 @@ static void q36_park(Model *m, int np, int max_tok) {
             g_q36_park.mtp_rows = r; g_q36_park.mtp_stride = p->stride;
         }
     }
-#ifdef COLI_VULKAN
-    ok = ok && q36_mg_park(m, n, 1);
-#endif
-#ifdef COLI_CUDA
-    ok = ok && q36_mc_park(m, n, 1);
-#endif
     /* the DeltaNet state from the device too, before anything of the request runs */
     ok = ok && (g_q36_park.st = q36_pin_state_save(m, NULL)) != NULL;
     if (!ok) { q36_park_free(m); return; }
@@ -7392,23 +6328,11 @@ static void q36_unpark(Model *m) {
         q36_park_copy(c, p->Vc, p->stride, g_q36_park.mv, g_q36_park.mtp_rows, 0);
     }
     int head = 1;
-#ifdef COLI_VULKAN
-    head = q36_mg_park(m, 0, 0) && head;
-#endif
-#ifdef COLI_CUDA
-    head = q36_mc_park(m, 0, 0) && head;
-#endif
     q36_pin_state_put(m, g_q36_park.st);
     if (!head && p->on) { p->has_pend = 0; p->len = -1; }   /* the head's device rows are the request's: it rests until a prompt from 0 */
     kv_prefix_clear(&m->kvp);
     kv_prefix_record(&m->kvp, g_q36_park.fed, 0, g_q36_park.len);
     m->kv_len = g_q36_park.kv_len;
-#ifdef COLI_VULKAN
-    q36c_rollback(m, -1, 0);   /* every mirror's watermark to 0: the rows go up again from the host */
-#endif
-#ifdef COLI_CUDA
-    q36cc_rollback(m, -1, 0);
-#endif
     if (getenv("COLI_PREFIX_LOG")) fprintf(stderr, "[PREFIX] the %d-token conversation is back\n", g_q36_park.len);
     q36_park_free(m);
 }
@@ -7662,12 +6586,6 @@ static int q36_spec_alloc(Model *m, int rows) {
 /* Back to the state after the verify's first `keep` rows, `len` positions fed. */
 static void q36_spec_rollback(Model *m, int len, int keep) {
     Cfg *c = &m->c; int slot = keep - 1;
-#ifdef COLI_VULKAN
-    q36c_rollback(m, slot, len);   /* the dense chain's own copies: its device buffers swap too */
-#endif
-#ifdef COLI_CUDA
-    q36cc_rollback(m, slot, len);
-#endif
     for (int i = 0; i < c->n_layers; i++) {
         if (c->is_attn[i]) continue;
         float *t = m->DN_rec[i]; m->DN_rec[i] = m->snap_rec[slot][i]; m->snap_rec[slot][i] = t;
@@ -7882,7 +6800,6 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     m->kv_len = 0;
     for (int i = 0; i < np; i++) out[i] = prompt[i];
     float *logit = step(m, prompt, np, 0);
-    qt_stats_mark();   /* [qtier] stats also report the hit rate from here on */
     int len = np;
     Q36Spec *sp = &g_q36_run_spec;
     q36_spec_begin(m, sp, prompt, np);   /* COLI_LOOKUP=1: drafts, every token still the argmax below */
@@ -8188,7 +7105,7 @@ static void emap_emit(Model *m){
     uint8_t *cells=calloc((size_t)rows*cols,1);
     pthread_mutex_lock(&g_pilot_mx);
     for(int i=0;i<rows;i++) for(int e=0;e<cols;e++)
-        cells[(size_t)i*cols+e]=(uint8_t)(((qt_is_resident(i,e)||vkt_resident(i,e))?2:slot_indexed(m,i,e)?1:0)<<6);   /* 2 = on a CUDA/Vulkan device */
+        cells[(size_t)i*cols+e]=(uint8_t)((slot_indexed(m,i,e)?1:0)<<6);
     pthread_mutex_unlock(&g_pilot_mx);
     char *hex=malloc((size_t)rows*cols*2+1); dash_hex(cells,rows*cols,hex);
     printf("EMAP %d %d %s\n",rows,cols,hex); fflush(stdout); free(hex); free(cells);
@@ -8363,7 +7280,6 @@ static int q36_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
         free(ids);
         return 0;
     }
-    qt_stats_mark();
     if (q->pin) pin_save(m, ids, np, lo);
     clk->s_disk=m->t_disk; clk->s_attn=tm_sum(0)+tm_sum(1); clk->s_moe=tm_sum(2); clk->s_head=tm_sum(5);
     clk->hits=m->hits; clk->miss=m->miss;
@@ -8439,14 +7355,6 @@ static void serve_one_turn(Model *m, ServeReq *q){
     fflush(stdout);
     {char scope[96]; snprintf(scope, sizeof scope, "turn %s", q->id); q36_spec_report(&spec, scope);}
     q36_spec_free(&spec);
-#ifdef COLI_CUDA
-    q36cc_report(m);
-#endif
-#ifdef COLI_VULKAN
-    vk_report();   /* stderr: the wire protocol on stdout is untouched */
-    q36c_report(m);
-    vk_tier_turn(m, "turn");
-#endif
 }
 /* one request on its own; a conversation it parked comes back when its turn ends */
 static void serve_one(Model *m, ServeReq *q){
@@ -8606,20 +7514,10 @@ static int q36_clef_decide(Model *m, const DecideRecord *rec, DecideAnswer *answ
         if (m->seen) memset(m->seen, 0, (size_t)c->n_layers * c->n_experts);
         if (m->momentum_logits) memset(m->momentum_logits, 0, (size_t)c->n_layers * c->n_experts * sizeof(float));
         g_hidden_sink = hidden;
-#ifdef COLI_VULKAN
-        double tb = decide_now_ms();
-#endif
         float *lo = step(m, in.ids, in.n, 0);
         g_hidden_sink = NULL;
         free(lo);
-#ifdef COLI_VULKAN
-        double th = decide_now_ms();
-#endif
         ok = clef_head_forward(&g_clef_head, hidden, &in, q36_clef_lm_row, m, logits, err, cap);
-#ifdef COLI_VULKAN
-        /* where a decision's time goes, for the device's measurements (docs/vulkan.md) */
-        fprintf(stderr, "[clef] %d tokens: backbone %.1f ms, head %.1f ms\n", in.n, th - tb, decide_now_ms() - th);
-#endif
     }
     for (int q = 0; ok && q < in.n_q; q++) {
         ok = clef_answer(&in.q[q], logits[q], &answers[q]);
@@ -8665,13 +7563,6 @@ static void clef_serve_one(Model *m, ServeReq *q){
         }
     }
     fprintf(stderr, "[clef] DECIDE %s: %d question(s), %d tokens, %.1f ms\n", q->id, rec.n_questions, tokens, elapsed);
-#ifdef COLI_CUDA
-    q36cc_report(m);
-#endif
-#ifdef COLI_VULKAN
-    vk_report();   /* stderr: the device's share of the decision */
-    q36c_report(m);
-#endif
     decide_answers_free(answers, answers ? rec.n_questions : 0);
     free(answers);
     decide_record_free(&rec);
@@ -8763,13 +7654,6 @@ static int q36_clef_test_modes(Model *m){
         printf("%s\n", out.data ? out.data : "{\"error\":\"out of memory\"}");
         fflush(stdout);
         free(out.data);
-#ifdef COLI_CUDA
-        q36cc_report(m);
-#endif
-#ifdef COLI_VULKAN
-        vk_report();
-        q36c_report(m);
-#endif
         clef_input_free(&in);
         decide_answers_free(answers, answers ? rec.n_questions : 0);
         free(answers);
@@ -8802,23 +7686,9 @@ typedef struct {
 
 static void q36_mux_bind(Model *m, int slot){
     if (g_q36_mux_cur == slot) return;
-    /* the chains' device state is the held conversation's: its DeltaNet state to the
-     * host before it leaves, nothing on the device the next one's */
-#ifdef COLI_VULKAN
-    if (g_vk_chain && g_q36_mux_cur >= 0) q36c_mux_leave(m);
-#endif
-#ifdef COLI_CUDA
-    if (g_cuda_chain && g_q36_mux_cur >= 0) q36cc_mux_leave(m);
-#endif
     if (g_q36_mux_cur >= 0) q36_seq_swap(m, &g_q36_mux_seq[g_q36_mux_cur]);   /* the held one back */
     if (slot >= 0) q36_seq_swap(m, &g_q36_mux_seq[slot]);
     g_q36_mux_cur = slot;
-#ifdef COLI_VULKAN
-    if (g_vk_chain) q36c_mux_enter(m, slot);
-#endif
-#ifdef COLI_CUDA
-    if (g_cuda_chain) q36cc_mux_enter(m, slot);
-#endif
 }
 
 /* The whole context's KV for every slot, before READY: slot 0 is the Model's own. */
@@ -8885,12 +7755,6 @@ static void serve_mux(Model *m){
     int eos_ids[Q36_MAX_EOS + 4]; int n_eos = serve_eos_ids(eos_ids, Q36_MAX_EOS + 4);
     unsigned long long steps = 0, nrows = 0;
     fprintf(stderr, "[qwen36] serving %d conversations at once (KV_SLOTS)\n", n);
-#ifdef COLI_VULKAN
-    if (g_vk_chain) q36c_mux_init(m);   /* each conversation's state on the device while there is room */
-#endif
-#ifdef COLI_CUDA
-    if (g_cuda_chain) q36cc_mux_init(m);
-#endif
     for (;;) {
         int active = 0; for (int i = 0; i < n; i++) active += rq[i].active;
         /* idle: wait for a command; decoding: take one only when one is there */
@@ -8947,14 +7811,6 @@ static void serve_mux(Model *m){
             free(lo);
         }
         if (ended) {
-#ifdef COLI_CUDA
-            q36cc_report(m);
-#endif
-#ifdef COLI_VULKAN
-            vk_report();
-            q36c_report(m);   /* the prompts the chain ran */
-            vk_tier_turn(m, "turn");
-#endif
             emap_emit(m);
         }
     }
@@ -9001,344 +7857,7 @@ static void serve_loop(Model *m){
  * in-memory model without a container (the QT_NO_WARMSTART check stays at the
  * call site). expert_is_int4 is what main probed from the on-disk expert size.
  */
-/* The bytes a slot hands the tier: planar int4 (the shared kernel's slots), the
- * container's packed int4, or the int8 weights themselves on an int8 container. */
-static void tier_src(Model *m, int layer, Slot *e, int expert_is_int4, const uint8_t **wg, const uint8_t **wu, const uint8_t **wd) {
-    if (g_gguf) {   /* the file's rows */
-        const GqExp *x = &m->gqx[layer];
-        const uint8_t *b = e->gqe ? gq_slot_file_rows(m, layer, e) : NULL;
-        *wg = b; *wu = b ? b + x->eb_g : NULL; *wd = b ? b + x->eb_g + x->eb_u : NULL;
-        return;
-    }
-    if (e->pw) { *wg = e->pw; *wu = e->pw + g_pw_gp; *wd = e->pw + 2 * g_pw_gp; return; }
-    *wg = expert_is_int4 ? e->g4 : (const uint8_t *)e->g;
-    *wu = expert_is_int4 ? e->u4 : (const uint8_t *)e->u;
-    *wd = expert_is_int4 ? e->d4 : (const uint8_t *)e->d;
-}
-static void tier_warmstart(Model *m, int expert_is_int4) {
-    /* Plan the set (heat order), then load+stage IN PARALLEL. The
-     * load path is thread-safe: expert_get locks the layer cache
-     * (g_pilot_mx), st_read_raw uses pread; entries are unique. */
-    double t0 = now_s();
-    int cap_total = m->c.n_layers * m->c.n_experts;
-    int *wpl = malloc((size_t)cap_total*sizeof(int));
-    int *wpe = malloc((size_t)cap_total*sizeof(int));
-    int wn = qt_plan_fill(wpl, wpe, cap_total);
-    if (qt_streaming()) {
-        /* Copy mode (the RAM holds fewer than every expert of a layer): each
-         * planned expert is read into a slot of the thread's own, handed over
-         * (the tier copies it before qt_note_planned returns) and dropped. The
-         * RAM cache is left to the experts the CPU computes, filled as they are
-         * routed: loading the planned ones there would spend its slots on
-         * experts the CPU never reads. */
-        #pragma omp parallel
-        {
-            Slot tmp; memset(&tmp, 0, sizeof tmp);
-            slot_ensure_allocated(m, &tmp);
-            #pragma omp for schedule(dynamic, 4)
-            for (int i = 0; i < wn; i++) {
-                const uint8_t *wg, *wu, *wd;
-                load_expert_merged(m, wpl[i], wpe[i], &tmp);
-                tier_src(m, wpl[i], &tmp, expert_is_int4, &wg, &wu, &wd);
-                qt_note_planned(wpl[i], wpe[i], wg, wu, wd, tmp.gs, tmp.us, tmp.ds);
-            }
-            free(tmp.pw); free(tmp.g); free(tmp.gs); free(tmp.g4); free(tmp.u4); free(tmp.d4);
-            free(tmp.gqe); free(tmp.t8);
-        }
-        qt_fill_wait();
-        free(wpl); free(wpe);
-        fprintf(stderr, "[qtier] warmstart (parallel): %d experts in VRAM, the RAM cache fills as the CPU's experts are routed -- %.1f s\n",
-                wn, now_s()-t0);
-        return;
-    }
-    /* Load ALL experts into RAM, not just the planned (VRAM) set:
-     * otherwise the first touch of a CPU-fallback expert triggers a
-     * ~12 ms container read in the middle of decode (measured: 139
-     * ms/token on a single-GPU run). Planned ones also go to VRAM. */
-    uint8_t *planned = calloc((size_t)cap_total, 1);
-    for (int i = 0; i < wn; i++) planned[wpl[i]*m->c.n_experts + wpe[i]] = 1;
-    int keep8 = getenv("COLI_KEEP_INT8") != NULL;
-    #pragma omp parallel for schedule(dynamic, 16)
-    for (int gi = 0; gi < cap_total; gi++) {
-        int l = gi / m->c.n_experts, eidw = gi % m->c.n_experts;
-        if (q36_dense_l(&m->c, l)) continue;   /* Flint's dense layers carry no experts */
-        Slot *e; expert_get(m, l, eidw, &e);
-        /* int4: i puntatori impacchettati (o planari); int8: i pesi stessi.
-         * Prima qui si esigeva e->g4, che su un container int8 e' NULL: la
-         * promozione non partiva mai e il budget restava riservato a
-         * vuoto (#1331). */
-        const uint8_t *wg, *wu, *wd;
-        tier_src(m, l, e, expert_is_int4, &wg, &wu, &wd);
-        if (planned[gi]) {
-            /* Reported even when wg is NULL: the tier reserved budget for
-             * this expert in qt_plan_fill, and a planned expert that is never
-             * reported keeps that reservation forever. With no weights the
-             * tier hands the bytes back instead of uploading. */
-            qt_note_planned(l, eidw, wg, wu, wd, e->gs, e->us, e->ds);
-            if (!wg) continue;
-            /* The staging copy is done. On an int4 container the int8 copy
-             * can go RIGHT AWAY so it never shows up in peak RSS: g4/u4/d4
-             * stay as the source of truth, and slot_ensure_int8() rebuilds
-             * the int8 block on an LFRU eviction with no container access.
-             * An int8 container has no second copy -- e->g4 is NULL -- so
-             * freeing e->g there both dangles the pointer qt_note_planned
-             * just stored (any later stage() reads freed memory) and leaves
-             * slot_ensure_int8() unable to bring the expert back: it returns
-             * early without g4, and the CPU fallback in the decode loop then
-             * dereferences NULL. Keep it (#1341). COLI_KEEP_INT8 keeps its
-             * meaning for int4.
-             * The condition is ownership, not format: do not free what was
-             * just handed over. int4 handed g4 (wg != e->g), so the int8
-             * copy is spare; int8 handed e->g itself, so it stays. A future
-             * format that also aliases e->g is then correct without anyone
-             * remembering to extend a format check here. */
-            if (!keep8 && e->g && wg != (const uint8_t *)e->g) { free(e->g); e->g = e->u = e->d = NULL; }
-        } else if (wg) {
-            /* the host pool: the RAM copy the device copies a prompt chunk's experts from */
-            qt_note_host(l, eidw, wg, wu, wd, e->gs, e->us, e->ds);
-        }
-    }
-    qt_fill_wait();
-    if (qt_chain_host_count())
-        fprintf(stderr, "[qtier] host pool: %d experts of the RAM cache page-locked for the device to copy a prompt chunk's "
-                        "experts from (COLI_CUDA_HOST_POOL=0 off)\n", qt_chain_host_count());
-    free(wpl); free(wpe); free(planned);
-    /* The parenthesis used to read "int8 only for non-residents", which was
-     * true only while the int8 copy of every resident was freed. Since #1341
-     * that free is int4-only: on an int8 container every resident keeps its
-     * weights, so the RSS saving the old line implied does not exist there.
-     * Say which container this is instead of promising a saving the reader
-     * will not see. */
-    fprintf(stderr, "[qtier] warmstart (parallel): all %d experts in RAM (%s), %d in VRAM -- %.1f s\n",
-            cap_total,
-            xf_mode(m) ? "planar int4, the only copy"
-            : expert_is_int4 ? "int8 copy dropped for residents, kept for non-residents"
-                             : "int8 container: all experts keep their weights in RAM",
-            wn, now_s()-t0);
-}
 
-#ifdef COLI_VULKAN
-/* ---- the Vulkan routed-expert tier: start ----------------------------------------
- * After the weights and the device: how the experts sit in the slots (the shared
- * kernel's planar int4, or the int8 copy of an int4 / int8 container, gate/up and
- * down each with their own scales), the dense matrices still to come to the device,
- * the RAM the expert cache may still take; the history this engine keeps for the
- * tier (route_trace.h's .coli_usage, beside the snapshot or COLI_USAGE), and from it
- * a warm start, read through temporary slots in parallel. */
-static size_t vk_qw_bytes(const QW *w) {
-    return w->q4 ? (size_t)w->O * (w->I / 2) + (size_t)w->O * (w->I / 64) * sizeof(float)
-         : w->q  ? (size_t)w->O * w->I + (size_t)w->O * sizeof(float)
-         : w->w  ? (size_t)w->O * w->I * sizeof(float) : 0;
-}
-/* What still goes to the device after the tier starts: not a matrix placed already (the
- * chain's setup at start, or the dense weights on the device only) nor one that stays
- * on the CPU (a partial chain's CPU layers and head: vk_off). */
-static size_t vk_qw_still(const QW *w) { return w->vk || w->vk_off ? 0 : vk_qw_bytes(w); }
-static size_t vk_dense_bytes(Model *m) {
-    if (!g_vk_dense && !g_vk_chain) return 0;
-    if (coli_vk_dense_device_only()) return 0;   /* placed already (q36_dho_start): the free memory the tier reads counts them */
-    size_t b = vk_qw_still(&m->lm_head);
-    for (int i = 0; i < m->c.n_layers; i++) {
-        Layer *L = &m->L[i];
-        const QW *w[] = {&L->q, &L->k, &L->v, &L->o, &L->gate, &L->sh_g, &L->sh_u, &L->sh_d,
-                         &L->dn_qkv, &L->dn_z, &L->dn_out};
-        for (size_t k = 0; k < sizeof w / sizeof *w; k++) b += vk_qw_still(w[k]);
-    }
-    return b;
-}
-/* Is the expert in this layer's RAM cache now (the tier's balance asks)? */
-static int vk_in_ram(void *ctx, int layer, int e) {
-    Model *m = ctx;
-    pthread_mutex_lock(&g_pilot_mx);
-    int r = slot_indexed(m, layer, e) != NULL;
-    pthread_mutex_unlock(&g_pilot_mx);
-    return r;
-}
-/* The tier's host pool took `bytes` of the RAM the expert cache was sized from (vk_tier.h,
- * ram_given): fewer slots a layer, top-k at least (COLI_VK_TIER_HOST_GB sizes the pool
- * instead, and the cache keeps its size). */
-static size_t g_vk_slot_bytes;
-static void vk_ram_given(void *ctx, size_t bytes) {
-    Model *m = ctx;
-    const Cfg *c = &m->c;
-    int L = 0, was = 0, now = 0;
-    for (int i = 0; m->cache && i < c->n_layers; i++) L += m->cache[i].slots != NULL;
-    if (L < 1 || !g_vk_slot_bytes) return;
-    const size_t per = g_vk_slot_bytes * (size_t)L;
-    const int cut = (int)((bytes + per - 1) / per);
-    pthread_mutex_lock(&g_pilot_mx);
-    for (int i = 0; i < c->n_layers; i++) {
-        LCache *lc = &m->cache[i];
-        if (!lc->slots) continue;
-        int cap = lc->cap - cut;
-        if (cap < c->topk) cap = c->topk;
-        if (cap < lc->n) cap = lc->n;   /* slots filled already stay */
-        if (cap > lc->cap) cap = lc->cap;
-        was = lc->cap; now = cap; lc->cap = cap;
-    }
-    pthread_mutex_unlock(&g_pilot_mx);
-    fprintf(stderr, "[VK] qwen36: the tier's host pool took %.1f GiB of the RAM the expert cache was sized from: %d slots a layer, not %d\n",
-            bytes / 1073741824.0, now, was);
-}
-/* After the device, the chain, a qpack container and the CUDA tier are decided, before
- * the expert tier sizes its budget: the dense matrices go up now, so the tier sees them
- * placed. The CUDA tier and a qpack container keep the host copies (the dense part
- * stays theirs or the CPU's). */
-/* With the fit of a partial chain (q36c_start) only the N layers' matrices (and the head's
- * when it goes up) count: the CPU's are vk_off. The chain's setup then drops each layer's
- * host copies once the layer is on the device (q36c_place, then q36_dho_placed). */
-static void q36_dho_placed(void) {
-    if (coli_vk_device_integrated() && coli_vk_imported_bytes())
-        fprintf(stderr, "[VK] qwen36: dense rows shared with the integrated GPU, %.1f MiB read in place; "
-                        "the imported pages stay alive as the only weight copy\n", coli_vk_imported_bytes() / 1048576.0);
-    coli_vk_dense_host_placed("qwen36", "the embedding (its rows are gathered on the CPU), the DeltaNet's a/b rows and "
-                              "the shared expert's gate vector, norms, the vision tower, any imported pages");
-}
-static void q36_dho_start(Model *m) {
-    if (!g_vk_ready) return;
-    size_t bytes = 0; int n = 0;
-    q36_dho_each(m, q36_dho_count, &bytes, &n);
-    if (!coli_vk_dense_host_decide("qwen36", (g_vk_chain || g_vk_dense) && n > 0 && !qt_ready() && !qq_active(), bytes))
-        return;
-    g_q36_dho_model = m;
-    g_vk_dense = 1;   /* the steps the chain declines run their matrices on the device too: the CPU has none */
-    if (g_q36c_fit_on && g_vk_chain) return;   /* the chain's setup drops them layer by layer (q36c_place) */
-    bytes = 0; n = 0;
-    q36_dho_each(m, q36_dho_drop, &bytes, &n);
-    q36_dho_placed();
-}
-
-/* The tier's streaming (a big prompt chunk's cold experts on the device): an expert's
- * bytes as the CPU path would have them, its RAM cache or the disk, held until the tier
- * has copied them. */
-static int vk_load(void *ctx, int layer, int e, VktExpertSrc *src, void **h) {
-    Model *m = ctx;
-    Slot *s = expert_hold(m, layer, e);
-    if (!s) return 0;
-    if (!xf_mode(m) && !g_gguf) slot_ensure_int8(m, s);
-    *src = vk_slot_src(m, layer, s); *h = s;
-    return 1;
-}
-static void vk_release(void *ctx, void *h) { (void)ctx; slot_release((Slot *)h); }
-/* What the serve allocates once the tier is up (VktConfig.ram_later): the KV cache at the
- * served context, a sliding layer's ring (q36_ring_for), for each conversation (KV_SLOTS),
- * and the attention's score rows, one per thread (#2314: a pool sized from the RAM free
- * before them took their room and the KV cache's allocation failed). */
-static size_t q36_kv_later(Model *m) {
-    Cfg *c = &m->c; int ctx = qwen36_max_ctx(), R = q36_ring_for(c, ctx);
-    size_t row = (size_t)c->kv_heads * c->k_head_dim * 2 * q36_kv_es(), b = 0;
-    for (int i = 0; i < c->n_layers; i++)
-        if (c->is_attn[i]) b += row * (size_t)(R && c->win_layer && c->win_layer[i] ? R : ctx);
-    int thr = 1;
-#ifdef _OPENMP
-    thr = omp_get_max_threads();
-#endif
-    return b * (size_t)(g_q36_mux_slots > 1 ? g_q36_mux_slots : 1) + (size_t)thr * ctx * sizeof(float);
-}
-static void vk_tier_start(Model *m, const char *snap, int cap, int expert_is_int4, int expert_mixed) {
-    Cfg *c = &m->c;
-    if (!g_vk_ready || c->n_experts == 0 || qq_active()) return;
-    if (qt_ready()) { fprintf(stderr, "[VK] tier qwen36: the CUDA expert tier is on and wins; the Vulkan tier stays off\n"); return; }
-    const char *on = getenv("COLI_VK_TIER");
-    if (on && *on == '0') return;
-    int gs = c->expert_gs, dgs = down_gs_of(c);
-    VktFmt gu, dn;
-    VktFmt *lgu = NULL, *ldn = NULL;   /* the GGUF's types by layer, when they differ */
-    if (g_gguf) {
-        /* the blocks as the file has them when every layer has one type for gate and up,
-         * no per-expert scale and whole blocks in both widths, the types free to change
-         * from layer to layer (published files give a few layers bigger ones); else int8
-         * per 32 (COLI_VK_GGUF_RAW=0 too) */
-        const char *re = getenv("COLI_VK_GGUF_RAW");
-        int raw = !(re && re[0] == '0'), L = c->n_layers, best = 0, bestn = 0, mixed = 0;
-        for (int l = 0; raw && l < L; l++) {
-            const GqExp *x = &m->gqx[l];
-            int bg = coli_vk_block_elems(100 + x->tg), bd = coli_vk_block_elems(100 + x->td);
-            if (x->tu != x->tg || x->sg || x->su || x->sd || !bg || !bd || q36_eh(c) % bg || c->inter % bd) raw = 0;
-            if (x->tg != m->gqx[0].tg || x->td != m->gqx[0].td) mixed = 1;
-        }
-        for (int l = 0; raw && l < L; l++) {   /* the commonest pair is the tier's main form */
-            int n = 0;
-            for (int j = 0; j < L; j++) n += m->gqx[j].tg == m->gqx[l].tg && m->gqx[j].td == m->gqx[l].td;
-            if (n > bestn) { bestn = n; best = l; }
-        }
-        if (raw && mixed && (!(lgu = malloc((size_t)L * sizeof *lgu)) || !(ldn = malloc((size_t)L * sizeof *ldn)))) raw = 0;
-        if (raw) {
-            const int tg = m->gqx[best].tg, td = m->gqx[best].td;
-            gu = (VktFmt){(VktSrc)(VKT_SRC_GGML + tg), 0}; dn = (VktFmt){(VktSrc)(VKT_SRC_GGML + td), 0};
-            for (int l = 0; mixed && l < L; l++) {
-                lgu[l] = (VktFmt){(VktSrc)(VKT_SRC_GGML + m->gqx[l].tg), 0};
-                ldn[l] = (VktFmt){(VktSrc)(VKT_SRC_GGML + m->gqx[l].td), 0};
-            }
-            g_vk_gguf_raw = 1;
-            fprintf(stderr, "[VK] tier qwen36: the GGUF experts' blocks go to the device as the file has them "
-                            "(%s gate/up, %s down", gq_type_name(tg), gq_type_name(td));
-            if (mixed) fprintf(stderr, " on %d of %d layers, the others their own types", bestn, L);
-            fprintf(stderr, "; COLI_VK_GGUF_RAW=0: int8 per 32)\n");
-        } else { free(lgu); free(ldn); lgu = ldn = NULL; gu = (VktFmt){VKT_SRC_I8_GS, 32}; dn = gu; }
-    }
-    else if (xf_mode(m)) { gu = (VktFmt){VKT_SRC_I4U_PLANAR64, 64}; dn = gu; }
-    else if (expert_mixed) {   /* int4 gate/up unpacked to int8 in the slot, int8 down */
-        gu = (VktFmt){gs ? VKT_SRC_I8_AS_I4_GS : VKT_SRC_I8_AS_I4_ROW, gs};
-        dn = (VktFmt){dgs ? VKT_SRC_I8_GS : VKT_SRC_I8_ROW, dgs};
-    } else if (expert_is_int4) {
-        gu = (VktFmt){gs ? VKT_SRC_I8_AS_I4_GS : VKT_SRC_I8_AS_I4_ROW, gs}; dn = gu;
-    } else {
-        gu = (VktFmt){gs ? VKT_SRC_I8_GS : VKT_SRC_I8_ROW, gs}; dn = gu;
-    }
-    int64_t ng = (int64_t)c->inter * q36_eh(c);
-    size_t slot = g_vk_slot_bytes = g_gguf ? (size_t)m->gqe_max
-                : (size_t)(xf_mode(m) ? (2 * ng + ng) / 2 : 3 * ng) +
-                  (size_t)(2 * scale_count_gu(c) + scale_count_d(c)) * sizeof(float);
-    VktConfig vc = {.engine = "qwen36", .layers = c->n_layers, .experts = c->n_experts,
-                    .hidden = q36_eh(c), .inter = c->inter, .topk = c->topk,
-                    .gate_up = gu, .down = dn, .act = VKT_ACT_SWIGLU,
-                    .max_rows = QWEN_VK_ROWS * c->topk,
-                    .ram_reserve = slot * (size_t)cap * (size_t)c->n_layers,
-                    .ram_floor = slot * (size_t)c->topk * (size_t)c->n_layers, .ram_given = vk_ram_given,
-                    .ram_later = q36_kv_later(m),
-                    .dense_bytes = vk_dense_bytes(m), .stage = g_vk_chain,
-                    .chain_bytes = g_vk_chain ? q36c_late_bytes(m, qwen36_max_ctx() < Q36C_KV_START ? qwen36_max_ctx() : Q36C_KV_START) : 0,
-                    .in_ram = vk_in_ram, .ram_ctx = m,
-                    .load = vk_load, .release = vk_release, .load_ctx = m,
-                    .layer_gate_up = lgu, .layer_down = ldn};
-    rt_init("qwen36", c->n_layers, c->n_experts);
-    rt_drop_row(c->n_layers);   /* no MTP row */
-    for (int i = 0; i < c->n_layers; i++)   /* Flint's dense layers: no experts, no history row */
-        if (c->dense_layer && c->dense_layer[i]) rt_drop_row(i);
-    const char *up = getenv("COLI_USAGE");
-    if (up && *up) snprintf(g_vk_usage, sizeof g_vk_usage, "%s", up);
-    else snprintf(g_vk_usage, sizeof g_vk_usage, "%s/.coli_usage", snap);
-    int64_t h = rt_load(g_vk_usage);
-    if (h > 0) fprintf(stderr, "[USAGE] expert history: %lld selections (%s)\n", (long long)h, g_vk_usage);
-    atexit(coli_vk_shutdown);   /* before vkt_init, which makes the expert batch's pipelines and can still refuse (no room): the device goes at exit either way, after the tier's teardown */
-    int tier_on = vkt_init(&vc, rt_counts_all());
-    free(lgu); free(ldn);   /* read during vkt_init only */
-    if (!tier_on) { rt_destroy(); return; }
-    m->vk_hist = 1;
-    atexit(vkt_shutdown);
-    int all = c->n_layers * c->n_experts;
-    int *pl = malloc((size_t)all * sizeof(int)), *pe = malloc((size_t)all * sizeof(int));
-    const char *warm = getenv("COLI_VK_TIER_WARM");   /* 0: no warm start, the tier fills as experts pass by */
-    int n = pl && pe && !(warm && *warm == '0') ? vkt_plan(pl, pe, all) : 0;
-    if (n > 0) {
-        double t0 = now_s();
-        #pragma omp parallel for schedule(dynamic, 4)
-        for (int i = 0; i < n; i++) {
-            Slot tmp; memset(&tmp, 0, sizeof tmp);
-            slot_ensure_allocated(m, &tmp);
-            load_expert_merged(m, pl[i], pe[i], &tmp);
-            VktExpertSrc src = vk_slot_src(m, pl[i], &tmp);
-            vkt_put(pl[i], pe[i], &src);
-            free(tmp.pw); free(tmp.g); free(tmp.gs); free(tmp.g4); free(tmp.u4); free(tmp.d4);
-            free(tmp.gqe); free(tmp.t8); free(tmp.t8s);
-        }
-        vkt_put_done();
-        vkt_warm_report("qwen36", n, now_s() - t0);
-    }
-    free(pl); free(pe);
-}
-#endif
 
 int main(int argc, char **argv) {
     /* Physical-core team sizing, as colibri/inkling/kimi_k3/olmoe/deepseek-v41
@@ -9347,7 +7866,7 @@ int main(int argc, char **argv) {
      * per-expert region (#718 measured +2.3x from the sizing alone on a
      * 16C/32T part). OMP_NUM_THREADS wins, COLI_NO_OMP_TUNE=1 disables. Before it,
      * the hot team (omp_tune.h), which re-runs the engine once with libgomp's settings. */
-    coli_omp_hot_team(argv, "qwen36", coli_omp_env_on("COLI_CUDA") || coli_omp_env_on("COLI_METAL"));
+    coli_omp_hot_team(argv, "qwen36", coli_omp_env_on("COLI_METAL"));
     coli_omp_tune_threads("qwen36");
     const char *snap = getenv("SNAP");
     if (!snap) { coli_print_launcher_help("Qwen3.6", "SNAP=<model directory> ./qwen36 ..."); return 1; }
@@ -9400,29 +7919,6 @@ int main(int argc, char **argv) {
          * backend without the block formats: 13.7 tok/s, the experts on the CPU) runs on
          * Vulkan in a build with both backends when CUDA was asked for and COLI_VULKAN was not
          * set; COLI_VULKAN=0 keeps CUDA. */
-        int cuda_blocks = 1;
-#ifdef COLI_CUDA
-        for (int i = 0; i < g_gg.n_tensors && cuda_blocks; i++) {
-            const char *nm = g_gg.t[i].name;
-            if (!strstr(nm, "_exps.weight")) continue;
-            const int t = g_gg.t[i].type;
-            cuda_blocks = cc_moe_block_type(t) && coli_cuda_block_elems(100 + t) > 0;
-        }
-#else
-        cuda_blocks = 0;
-#endif
-        {   const char *cu = getenv("COLI_CUDA"), *vk = getenv("COLI_VULKAN");
-            if (cu && *cu == '1' && !(vk && *vk) && !cuda_blocks) {
-#if defined(COLI_CUDA) && defined(COLI_VULKAN)
-                setenv("COLI_VULKAN", "1", 1); setenv("COLI_CUDA", "0", 1);
-                fprintf(stderr, "[gguf] the CUDA backend has no ggml block types: this GGUF runs on Vulkan, the same card "
-                                "(COLI_VULKAN=0 keeps CUDA, the routed experts then on the CPU)\n");
-#else
-                fprintf(stderr, "[gguf] the CUDA backend has no ggml block types: this GGUF's routed experts run on the CPU "
-                                "(a VK=1 build runs them on the card through Vulkan)\n");
-#endif
-            }
-        }
     }
     g_pilot = getenv("PILOT") ? atoi(getenv("PILOT")) : 0;
     g_wide  = getenv("WIDE")  ? atoi(getenv("WIDE"))  : 1;
@@ -9550,39 +8046,6 @@ int main(int argc, char **argv) {
     g_expert_gs = m.c.expert_gs;
     if (g_expert_gs) fprintf(stderr, "[qwen36] group-scaled experts: gs=%d\n", g_expert_gs);
     fprintf(stderr, "resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());
-#ifdef COLI_VULKAN
-    /* After the weights: the dense matrices upload at their first matmul_d.
-     * No device (or COLI_VULKAN unset) leaves g_vk_ready 0, the CPU path. */
-    g_vk_ready = coli_vk_init_env_tier("qwen36", vkt_wanted() && m.c.n_experts > 0 && !qq_active());
-    g_vk_dense = coli_vk_dense();   /* COLI_VK_DENSE; unset, off on a device sharing the CPU's RAM with the tier on */
-    /* COLI_VK_CHAIN: every layer's dense chain on the device (qwen36_chain.h); the
-     * CUDA expert tier and a qpack container keep it off, as they keep the tier off */
-    /* measured on a Radeon 780M: decode and prefill both faster (docs/vulkan.md) */
-    if (g_vk_ready && !qq_active())
-        g_vk_chain = coli_vk_chain_decide("qwen36", vkt_wanted() && m.c.n_experts > 0, COLI_VK_CHAIN_ON);
-    if (g_vk_chain && g_q36_mux_slots > 1)
-        fprintf(stderr, "[VK] qwen36: KV_SLOTS=%d: the dense chain keeps each conversation's state on the device while there "
-                        "is room, and runs its prompts and every conversation's decode rows (COLI_VK_CHAIN_MUX caps the places)\n",
-                g_q36_mux_slots);
-    if (g_vk_ready) {
-        /* COLI_VK_IMPORT: 1 the device reads the dense rows in place, 0 it copies them.
-         * Unset: in place for a model without routed experts (Qwen3.8-27B, Clef) on a
-         * device that shares the CPU's RAM, whose trunk is the whole model and would be
-         * held twice (54 GB in f16: past a 61 GB box; measured on a Radeon 780M, a
-         * prompt's GEMM within 4% and a decode GEMV within 9% of the copy's); a copy
-         * elsewhere, as before. */
-        const char *e = getenv("COLI_VK_IMPORT");
-        int want = e && *e ? atoi(e) != 0 : m.c.n_experts == 0 && coli_vk_device_shares_ram();
-        g_vk_import = want && coli_vk_import_alignment() > 0 && coli_vk_import_alignment() <= Q36_PAGE;
-        if (want || (e && *e))
-            fprintf(stderr, "[VK] qwen36: int8 and f16 dense rows %s (%s)\n", g_vk_import ? "read in place, not copied" : "copied",
-                    !want ? "COLI_VK_IMPORT=0" : g_vk_import ? (e && *e ? "COLI_VK_IMPORT=1" :
-                    "a dense model on a device sharing the CPU's RAM; COLI_VK_IMPORT=0 copies them")
-                    : "this device cannot import host memory");
-    }
-    /* the chain's pipelines come up with its fit (q36c_start, below): nothing of the
-     * chain is on the device before it has decided how many layers fit */
-#endif
     if (ref_image && ref_image->t == J_OBJ) {
         jval *gh = json_get(ref_image, "grid_h"), *gw = json_get(ref_image, "grid_w");
         jval *pv = json_get(ref_image, "patches");
@@ -9695,213 +8158,14 @@ int main(int argc, char **argv) {
      * No entry (dense-i8 off) means nothing to offer, and the CPU path stands.
      * A qpack container owns routed execution outright, so it must not seed
      * CUDA placement state for a tier that is deliberately skipped below. */
-    if (!qq_active()) {
-        int O_qkv = m.c.dn_conv_dim, O_z = m.c.dn_vheads * m.c.dn_vdim;
-        if (m.lm_head.q)
-            qt_trunk_offer("lmhead", 0, (size_t)m.lm_head.I * m.lm_head.O + (size_t)m.lm_head.O * sizeof(float));
-        else if (qdw_gq_bytes(&m.lm_head)) qt_trunk_offer("lmhead", 0, qdw_gq_bytes(&m.lm_head));   /* a GGUF's blocks */
-        for (int i = 0; i < m.c.n_layers; i++) {
-            if (m.c.is_attn[i]) continue;
-            if (m.L[i].dn_qkv.q && m.L[i].dn_z.q)
-                qt_trunk_offer("dnproj", i, (size_t)(O_qkv + O_z) * m.c.hidden + (size_t)(O_qkv + O_z) * sizeof(float));
-            else if (qdw_gq_fmt(&m.L[i].dn_qkv) && qdw_gq_fmt(&m.L[i].dn_qkv) == qdw_gq_fmt(&m.L[i].dn_z))   /* one type: one fused matrix */
-                qt_trunk_offer("dnproj", i, qdw_gq_bytes(&m.L[i].dn_qkv) + qdw_gq_bytes(&m.L[i].dn_z));
-        }
-        trunk_offer_dense(&m);   /* dnout, attnproj, shexp: the rest of the per-token dense work */
-    }
-    if (expert_mixed && getenv("COLI_CUDA") && getenv("COLI_CUDA")[0] == '1')
-        fprintf(stderr, "[qwen36] COLI_CUDA=1: the VRAM expert tier does not take the mixed layout (one format per expert): "
-                        "the routed experts stay on the CPU\n");
     /* The sentinel never leaves main() unresolved: see qwen36_resolved_cap. */
     cap = qwen36_resolved_cap(cap, m.cache, m.c.n_layers);
-    /* A GGUF's experts go to the CUDA tier as the file has them (the backend's block formats)
-     * when every layer's types are ones the dense chain's frame computes (cc_moe); else the
-     * tier holds the trunk only and the experts stay the CPU's. */
-    int gguf_tier = 0;
-#ifdef COLI_CUDA
-    /* the CUDA chain uploads its own router, DeltaNet b|a and gate rows after the tier sized
-     * its budget: out of the tier's allowance, or the tier fills the card and the chain's
-     * prompt scratch and KV mirror find no room (Muse Spark's f32 router: 496 MiB) */
-    if (q36cc_env_on() && getenv("COLI_CUDA") && getenv("COLI_CUDA")[0] == '1') {
-        qt_reserve(q36cc_own_bytes(&m) + q36cc_mirror_bytes(&m, qwen36_max_ctx()));   /* and the KV mirrors of a model whose chain needs them whole */
-        q36_gguf_stage_reserve(&m);   /* and a GGUF's prompt staging, where the card holds fewer than all its experts */
-    }
-#endif
-#ifdef COLI_CUDA
-    if (g_gguf && !qq_active() && m.c.n_experts > 0 && getenv("COLI_CUDA") && getenv("COLI_CUDA")[0] == '1') {
-        const int L = m.c.n_layers;
-        int *tg = malloc((size_t)L * sizeof(int)), *td = malloc((size_t)L * sizeof(int));
-        size_t *bg = malloc((size_t)L * sizeof(size_t)), *bdn = malloc((size_t)L * sizeof(size_t));
-        int ok = tg && td && bg && bdn;
-        for (int l = 0; ok && l < L; l++) {
-            const GqExp *x = &m.gqx[l];
-            ok = x->tg == x->tu && !x->sg && !x->su && !x->sd && cc_moe_block_type(x->tg) && cc_moe_block_type(x->td) &&
-                 coli_cuda_block_elems(100 + x->tg) > 0 && coli_cuda_block_elems(100 + x->td) > 0 &&
-                 q36_eh(&m.c) % coli_cuda_block_elems(100 + x->tg) == 0 && m.c.inter % coli_cuda_block_elems(100 + x->td) == 0;
-            if (ok) { tg[l] = x->tg; td[l] = x->td; bg[l] = (size_t)x->eb_g; bdn[l] = (size_t)x->eb_d; }
-        }
-        /* each expert in a slot of its own layer's size (COLI_CUDA_EXACT_SLOTS=0: the largest layer's) */
-        { const char *xs = getenv("COLI_CUDA_EXACT_SLOTS"); qt_gguf_exact_slots(!(xs && *xs == '0')); }
-        if (ok && qt_init_gguf(L, m.c.n_experts, q36_eh(&m.c), m.c.inter, cap, m.c.topk, tg, td, bg, bdn, 0)) {
-            gguf_tier = 1;   /* the slots' rows stay */
-            gguf_hold_file_rows(&m);
-        }
-        else fprintf(stderr, "[qwen36] COLI_CUDA=1: %s; the routed experts stay on the CPU\n",
-                     ok ? "the CUDA expert tier did not start" : "the GGUF's expert types are not all ones the CUDA chain's experts take");
-        free(tg); free(td); free(bg); free(bdn);
-    }
-#endif
-    /* The tier takes the experts whatever the RAM holds (below full residency it
-     * copies them as they pass), as planar int4 when the shared kernel keeps
-     * them so, and no experts of the mixed layout (one format per expert): the
-     * dense trunk goes to the devices all the same (-1). Not a GGUF. */
-    if (m.c.n_experts > 0 && !g_gguf) qt_source_planar(xf_mode(&m));
-    /* a dense model (no routed experts: LFM3, the dense Qwen3.5 and Qwen3) starts the tier for
-     * its trunk alone (-1), which the CUDA chain runs whole */
-    if (gguf_tier || (!qq_active() && !g_gguf && m.c.n_experts > 0 &&
-        qt_init(m.c.n_layers, m.c.n_experts, q36_eh(&m.c), m.c.inter, cap, m.c.topk,
-                m.c.expert_gs, expert_mixed ? -1 : expert_is_int4)) ||
-        (!qq_active() && m.c.n_experts == 0 && qt_init(m.c.n_layers, 0, m.c.hidden, 0, 1, 1, 0, -1))) {
-        fprintf(stderr, qt_experts_on() ? "[gpu] MoE experts -> CUDA VRAM tier\n"
-                                        : "[gpu] dense trunk -> CUDA (the routed experts stay on the CPU)\n");
-        atexit(qt_shutdown);
-        for (int i = 0; i < m.c.n_layers; i++) if (q36_dense_l(&m.c, i)) qt_layer_off(i);   /* Flint's dense layers */
-        /* The placer predicted; measure before uploading a byte of trunk. */
-        if (!trunk_probe_gpu_wins(&m)) {
-            qt_trunk_withdraw("measured slower than the CPU");
-            qt_experts_withdraw("the device's GEMV measured slower than the CPU's");
-        }
-        /* R4 role split: park the dense-i8 lm_head on COLI_LMHEAD_GPU. The
-         * QW struct on m.lm_head holds the int8 rows + per-row scales the
-         * CPU path uses; the GPU applies the identical semantics. */
-        if (m.lm_head.q)
-            qt_lmhead_init(m.lm_head.q, m.lm_head.sc, m.lm_head.I, m.lm_head.O);
-        else if (qdw_gq_fmt(&m.lm_head)) {   /* a GGUF's blocks */
-            const int fmt = qdw_gq_fmt(&m.lm_head);
-            uint8_t *rows; const void *src = qdw_gq_rows(&m.lm_head, fmt, &rows);
-            if (src) qt_lmhead_init_fmt(src, NULL, fmt, m.lm_head.I, m.lm_head.O);
-            free(rows);
-        }
-        /* R4 step 2: DeltaNet input projections, per layer, wherever
-         * COLI_PLACE puts them. qkv and z are both [O_x, hidden] int8 with
-         * per-row scales, so fusing them is a concatenation along O -- two
-         * memcpys, no requantization, and the GPU sees one GEMV per layer
-         * instead of two. The host copy is freed right after the upload. */
-        {
-            int placed = 0, O_qkv = m.c.dn_conv_dim, O_z = m.c.dn_vheads * m.c.dn_vdim;
-            int Of = O_qkv + O_z, Hd = m.c.hidden;
-            double vram = 0;
-            for (int i = 0; i < m.c.n_layers; i++) {
-                if (m.c.is_attn[i]) continue;
-                int dev = qt_place_of("dnproj", i);
-                if (dev == QT_PLACE_CPU) continue;
-                const int8_t *q1 = m.L[i].dn_qkv.q, *q2 = m.L[i].dn_z.q;
-                const float *s1 = m.L[i].dn_qkv.sc, *s2 = m.L[i].dn_z.sc;
-                const int gf = qdw_gq_fmt(&m.L[i].dn_qkv);
-                if (!q1 && gf && gf == qdw_gq_fmt(&m.L[i].dn_z)) {   /* a GGUF's blocks: qkv's rows, then z's */
-                    const size_t rb = (size_t)gq_row_bytes(gf - 100, Hd);
-                    uint8_t *ra, *rz, *cat = malloc(rb * Of);
-                    const void *a = qdw_gq_rows(&m.L[i].dn_qkv, gf, &ra), *z = qdw_gq_rows(&m.L[i].dn_z, gf, &rz);
-                    if (cat && a && z) {
-                        memcpy(cat, a, rb * O_qkv); memcpy(cat + rb * O_qkv, z, rb * O_z);
-                        if (qt_dnproj_init_fmt(i, cat, NULL, gf, Hd, Of, dev)) { placed++; vram += (double)rb * Of; }
-                    }
-                    free(ra); free(rz); free(cat);
-                    continue;
-                }
-                if (!q1 || !q2) continue;      /* dense-i8 off: CPU path stands */
-                int8_t *qf = malloc((size_t)Of * Hd);
-                float  *sf = malloc((size_t)Of * sizeof(float));
-                if (!qf || !sf) { free(qf); free(sf); break; }
-                memcpy(qf, q1, (size_t)O_qkv * Hd);
-                memcpy(qf + (size_t)O_qkv * Hd, q2, (size_t)O_z * Hd);
-                memcpy(sf, s1, (size_t)O_qkv * sizeof(float));
-                memcpy(sf + O_qkv, s2, (size_t)O_z * sizeof(float));
-                if (qt_dnproj_init(i, qf, sf, Hd, Of, dev)) {
-                    placed++; vram += (double)Of * Hd;
-                }
-                free(qf); free(sf);
-            }
-            if (placed)
-                fprintf(stderr, "[dnp] %d DeltaNet-Projektionen auf GPU (%.2f GB VRAM)\n",
-                        placed, vram / 1073741824.0);
-        }
-        /* The rest of the trunk, wherever the placer put it: out_proj,
-         * attention projections, shared expert. Handles live in the Layer. */
-        {
-            double vram = 0; int kinds[3];
-            int placed = trunk_place_dense(&m, &vram, kinds);
-            if (placed)   /* by kind: the shared expert is placed only when offered (#2082) */
-                fprintf(stderr, "[dense] %d trunk matrices on GPU (%d dnout, %d attnproj, %d shexp; %.2f GB VRAM)\n",
-                        placed, kinds[0], kinds[1], kinds[2], vram / 1073741824.0);
-        }
-        /* Q36_DN_GPU=1: where the in_proj and the out_proj of a DeltaNet layer
-         * both sit on one card, the conv ring, the recurrence and the gated
-         * norm go there too, and a decode token runs the layer end to end on
-         * the device (qt_dn_gpu_step). Measured motivation: with the trunk in
-         * VRAM the CPU still spent ~8 of 39 ms/token on these steps -- not
-         * arithmetic, host round trips, thirty per token. */
-        /* the CUDA chain (on unless COLI_CUDA_CHAIN=0): every layer on the device as one chain (qwen36_cuda_chain.h),
-         * set up here, after the tier placed the trunk; it owns the DeltaNet state, so the
-         * per-layer step below is not set up beside it. */
-        int chain_up = 0;
-#ifdef COLI_CUDA
-        if (q36cc_env_on() && q36cc_setup(&m, g_q36_mux_slots)) { g_cuda_chain = 1; chain_up = 1; atexit(cc_shutdown); }
-#endif
-        if (!chain_up && dn_gpu_env_on()) {
-            int n = 0; double vram = 0;
-            for (int i = 0; i < m.c.n_layers; i++) {
-                if (m.c.is_attn[i] || !m.L[i].qth_dnout || !qt_dnproj_ready(i)) continue;
-                if (qt_dn_gpu_init(i, m.c.dn_vheads, m.c.dn_kheads, m.c.dn_kdim, m.c.dn_vdim, m.c.dn_conv_dim, m.c.dn_convk,
-                                   m.c.hidden, m.L[i].dn_conv, m.L[i].dn_norm, m.c.eps, m.L[i].qth_dnout)) {
-                    n++; vram += (double)m.c.dn_vheads * m.c.dn_kdim * m.c.dn_vdim * 4 + (double)m.c.dn_conv_dim * (m.c.dn_convk - 1) * 4;
-                }
-            }
-            m.dn_dev = n > 0;
-            if (m.dn_dev && g_q36_mux_slots > 1) {   /* the card holds one conversation's DeltaNet state */
-                m.dn_dev = 0;
-                fprintf(stderr, "[dn] KV_SLOTS=%d: DeltaNet on the CPU\n", g_q36_mux_slots);
-            }
-            if (n) fprintf(stderr, "[dn] %d DeltaNet layers run on the GPU end to end (conv, recurrence, gated norm; %.0f MB of state in VRAM)\n",
-                           n, vram / 1048576.0);
-            else fprintf(stderr, "[dn] Q36_DN_GPU=1 but no layer has both projections on one card; the CPU path stands\n");
-        }
-        /* Warmstart: fill the VRAM budget BEFORE the first token (heat order
-         * when HEAT_FILE exists, otherwise every layer's expert 0, then 1, ...),
-         * loading all RAM slots along the way. */
-        const char *nws = getenv("QT_NO_WARMSTART");
-        if (!(nws && *nws=='1') && qt_experts_on()) tier_warmstart(&m, expert_is_int4);
-    }
+    (void)cap;
 
-#ifdef COLI_VULKAN
-    q36c_start(&m);      /* COLI_VK_CHAIN: how many layers the chain places (vkc_fit), before any upload */
-    if (g_vk_chain && !g_q36c_fit_on && !vkc_init()) g_vk_chain = 0;   /* no fit (PILOT, a geometry, ...): as before */
-    q36_dho_start(&m);   /* COLI_VK_DENSE_HOST: the dense matrices on the device only, before the tier sizes its budget */
-    if (g_q36c_fit_on && g_vk_chain) {   /* the chain's layers on the device now, so the tier sizes after them */
-        q36c_place(&m);
-        if (coli_vk_dense_device_only()) {
-            coli_vk_dense_host_layers(g_q36c_fit.n, g_q36c_fit.L);
-            q36_dho_placed();
-        }
-    }
-    vk_tier_start(&m, snap, cap, expert_is_int4, expert_mixed);   /* COLI_VULKAN=1: hot routed experts on the device */
-    if (g_vk_ready && !vkt_ready() && !g_vk_dense) g_vk_dense = coli_vk_dense_decide("qwen36", 0, 1);   /* no tier after all */
-    if (g_vk_chain && qt_ready()) {   /* the CUDA tier keeps its priority */
-        fprintf(stderr, "[VK] qwen36: dense chain off, the CUDA expert tier is on\n");
-        g_vk_chain = 0;
-    }
-    if (g_vk_chain && g_pilot) fprintf(stderr, "[VK] qwen36: PILOT prefetch reads the residual on the host: the dense chain stays off\n");
-    if (g_vk_chain || g_q36c_fit_on) atexit(vkc_shutdown_all);   /* registered after the tier's: runs before the device goes */
-#endif
     q36_mtp_attach(&m);   /* Q36_MTP=1: the MTP head */
 
-    {   /* the trunk's int8 rows interleaved for the CPU, when no device reads them */
-        int dev = qt_ready();
-#ifdef COLI_VULKAN
-        dev = dev || g_vk_ready;
-#endif
-        if (!dev) q36_trunk_q8_interleave(&m);
-    }
+    /* the trunk's int8 rows interleaved for the CPU */
+    q36_trunk_q8_interleave(&m);
     /* coli serve mode: speak the gateway wire protocol instead of argv
      * generation. AFTER the tier init: serve sessions ride the VRAM experts
      * exactly like argv runs, and serve_loop never returns. */
@@ -9925,14 +8189,6 @@ int main(int argc, char **argv) {
                (unsigned long long)m.hits, (unsigned long long)m.miss);
         route_footer(stdout, &m);
         printf("Speed: %.2f tok/s (%.1fs for %d tokens) | PEAK RSS: %.2f GB\n", scored/dt, dt, scored, rss_gb());
-#ifdef COLI_CUDA
-        q36cc_report(&m);
-#endif
-#ifdef COLI_VULKAN
-        vk_report();
-        q36c_report(&m);
-        vk_tier_turn(&m, "run");
-#endif
         free(buf); free(arena); return 0;
     }
 
@@ -9996,7 +8252,6 @@ int main(int argc, char **argv) {
     q36_spec_report(&g_q36_run_spec, "run");
     q36_spec_free(&g_q36_run_spec);
     tm_report();
-    qt_stats();
     /* qpack dispatch evidence, mirroring what the parity gates assert: which
      * path computed the routed projections (coli_metal_matmul_affine_slot
      * returns 0 for CPU fallback by contract, and qq_counts is where that
@@ -10018,14 +8273,6 @@ int main(int argc, char **argv) {
            (unsigned long long)m.hits, (unsigned long long)m.miss);
     route_footer(stderr, &m);
     fprintf(stderr, "Speed: %.2f tok/s (%.1fs for %d tokens)\n", n_new/dt, dt, n_new);
-#ifdef COLI_CUDA
-    q36cc_report(&m);
-#endif
-#ifdef COLI_VULKAN
-    vk_report();
-    q36c_report(&m);
-    vk_tier_turn(&m, "run");
-#endif
     q36_mtp_vocab_save();
     free(buf); free(arena);
     /* Oracle mode is a gate, not a report: a mismatch must fail the caller.
@@ -10076,7 +8323,7 @@ static void qwen36_segment_model_destroy(Qwen36SegmentEngine *engine) {
         for (int slot = 0; slot < cache->n; slot++) {
             free(cache->slots[slot].g);
             free(cache->slots[slot].pw);
-            free(cache->slots[slot].gqe); free(cache->slots[slot].t8); free(cache->slots[slot].t8s);
+            free(cache->slots[slot].gqe);
             free(cache->slots[slot].gs);
             free(cache->slots[slot].g4);
             free(cache->slots[slot].u4);

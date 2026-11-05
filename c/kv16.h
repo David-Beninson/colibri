@@ -64,63 +64,75 @@ static inline float kv16_to(uint16_t b) {
 }
 #endif
 
-/* gcc does not vectorize the _Float16 casts: with F16C the three loops below convert eight
- * values at a time by the instructions those casts compile to (round to nearest even), the
- * clamp's operands ordered so a NaN passes through as kv16_clamp lets it: the same bits.
- * Before, kv16_round took about 0.2 ms of an OLMoE decode token (16 layers' K and V rows
- * down from the Vulkan chain) and about 20 ms of a 3K-token prompt. */
-#if defined(__F16C__) && defined(__AVX__) && defined(__FLT16_MAX__) && !defined(KV16_INTEGER)
-#include <immintrin.h>
-#define KV16_CVT8 1
-static inline __m256 kv16_clamp8(__m256 v) {
-    return _mm256_max_ps(_mm256_set1_ps(-KV16_MAX), _mm256_min_ps(_mm256_set1_ps(KV16_MAX), v));
+#if defined(__ARM_NEON) && defined(__FLT16_MAX__) && !defined(KV16_INTEGER)
+#include <arm_neon.h>
+#define KV16_NEON 1
+static inline float32x4_t kv16_clamp4(float32x4_t v) {
+    /* match kv16_clamp: x > MAX ? MAX : x < -MAX ? -MAX : x (NaN passes through) */
+    uint32x4_t gt = vcgtq_f32(v, vdupq_n_f32(KV16_MAX));
+    uint32x4_t lt = vcltq_f32(v, vdupq_n_f32(-KV16_MAX));
+    v = vbslq_f32(lt, vdupq_n_f32(-KV16_MAX), v);
+    return vbslq_f32(gt, vdupq_n_f32(KV16_MAX), v);
 }
 #endif
 /* x rounded in place to the floats its float16 holds */
 static inline void kv16_round(float *x, int64_t n) {
     int64_t i = 0;
-#ifdef KV16_CVT8
-    for (; i + 8 <= n; i += 8)
-        _mm256_storeu_ps(x + i, _mm256_cvtph_ps(_mm256_cvtps_ph(kv16_clamp8(_mm256_loadu_ps(x + i)), _MM_FROUND_TO_NEAREST_INT)));
+#ifdef KV16_NEON
+    for (; i + 8 <= n; i += 8) {
+        float16x4_t h0 = vcvt_f16_f32(kv16_clamp4(vld1q_f32(x + i)));
+        float16x4_t h1 = vcvt_f16_f32(kv16_clamp4(vld1q_f32(x + i + 4)));
+        vst1q_f32(x + i,     vcvt_f32_f16(h0));
+        vst1q_f32(x + i + 4, vcvt_f32_f16(h1));
+    }
 #endif
     for (; i < n; i++) x[i] = kv16_to(kv16_from(x[i]));
 }
 static inline void kv16_pack(uint16_t *d, const float *s, int64_t n) {
     int64_t i = 0;
-#ifdef KV16_CVT8
-    for (; i + 8 <= n; i += 8)
-        _mm_storeu_si128((__m128i *)(d + i), _mm256_cvtps_ph(kv16_clamp8(_mm256_loadu_ps(s + i)), _MM_FROUND_TO_NEAREST_INT));
+#ifdef KV16_NEON
+    for (; i + 8 <= n; i += 8) {
+        float16x4_t h0 = vcvt_f16_f32(kv16_clamp4(vld1q_f32(s + i)));
+        float16x4_t h1 = vcvt_f16_f32(kv16_clamp4(vld1q_f32(s + i + 4)));
+        vst1q_f16((__fp16 *)(d + i), vcombine_f16(h0, h1));
+    }
 #endif
     for (; i < n; i++) d[i] = kv16_from(s[i]);
 }
 static inline void kv16_unpack(float *d, const uint16_t *s, int64_t n) {
     int64_t i = 0;
-#ifdef KV16_CVT8
-    for (; i + 8 <= n; i += 8) _mm256_storeu_ps(d + i, _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(s + i))));
+#ifdef KV16_NEON
+    for (; i + 8 <= n; i += 8) {
+        float16x8_t h = vld1q_f16((const __fp16 *)(s + i));
+        vst1q_f32(d + i,     vcvt_f32_f16(vget_low_f16(h)));
+        vst1q_f32(d + i + 4, vcvt_f32_f16(vget_high_f16(h)));
+    }
 #endif
     for (; i < n; i++) d[i] = kv16_to(s[i]);
 }
 
-/* gcc does not vectorize a float16 -> float conversion without AVX512-FP16: the two loops
- * attention runs over every position, with F16C's conversion by hand, lane for lane the
- * scalar ones (lane j of 32 a fused multiply-add chain; the same halving tree after) */
-#if defined(__F16C__) && defined(__AVX__) && defined(__FMA__) && MATMUL_F32_LANES == 32
-#include <immintrin.h>
-#define KV16_F16C 1
-#endif
-
 static inline float kv16_dot_lanes(const float *x, const uint16_t *w, int I) {
     float a[MATMUL_F32_LANES] = {0};
     int i = 0;
-#ifdef KV16_F16C
-    __m256 c0 = _mm256_setzero_ps(), c1 = c0, c2 = c0, c3 = c0;
+#if defined(KV16_NEON) && MATMUL_F32_LANES == 32
+    float32x4_t c0 = vdupq_n_f32(0.f), c1 = c0, c2 = c0, c3 = c0;
+    float32x4_t c4 = c0, c5 = c0, c6 = c0, c7 = c0;
     for (; i + 32 <= I; i += 32) {
-        c0 = _mm256_fmadd_ps(_mm256_loadu_ps(x + i),      _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(w + i))),      c0);
-        c1 = _mm256_fmadd_ps(_mm256_loadu_ps(x + i + 8),  _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(w + i + 8))),  c1);
-        c2 = _mm256_fmadd_ps(_mm256_loadu_ps(x + i + 16), _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(w + i + 16))), c2);
-        c3 = _mm256_fmadd_ps(_mm256_loadu_ps(x + i + 24), _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(w + i + 24))), c3);
+        float16x8_t h0 = vld1q_f16((const __fp16 *)(w + i));
+        float16x8_t h1 = vld1q_f16((const __fp16 *)(w + i + 8));
+        float16x8_t h2 = vld1q_f16((const __fp16 *)(w + i + 16));
+        float16x8_t h3 = vld1q_f16((const __fp16 *)(w + i + 24));
+        c0 = vfmaq_f32(c0, vld1q_f32(x + i),      vcvt_f32_f16(vget_low_f16(h0)));
+        c1 = vfmaq_f32(c1, vld1q_f32(x + i + 4),  vcvt_f32_f16(vget_high_f16(h0)));
+        c2 = vfmaq_f32(c2, vld1q_f32(x + i + 8),  vcvt_f32_f16(vget_low_f16(h1)));
+        c3 = vfmaq_f32(c3, vld1q_f32(x + i + 12), vcvt_f32_f16(vget_high_f16(h1)));
+        c4 = vfmaq_f32(c4, vld1q_f32(x + i + 16), vcvt_f32_f16(vget_low_f16(h2)));
+        c5 = vfmaq_f32(c5, vld1q_f32(x + i + 20), vcvt_f32_f16(vget_high_f16(h2)));
+        c6 = vfmaq_f32(c6, vld1q_f32(x + i + 24), vcvt_f32_f16(vget_low_f16(h3)));
+        c7 = vfmaq_f32(c7, vld1q_f32(x + i + 28), vcvt_f32_f16(vget_high_f16(h3)));
     }
-    _mm256_storeu_ps(a, c0); _mm256_storeu_ps(a + 8, c1); _mm256_storeu_ps(a + 16, c2); _mm256_storeu_ps(a + 24, c3);
+    vst1q_f32(a,      c0); vst1q_f32(a + 4,  c1); vst1q_f32(a + 8,  c2); vst1q_f32(a + 12, c3);
+    vst1q_f32(a + 16, c4); vst1q_f32(a + 20, c5); vst1q_f32(a + 24, c6); vst1q_f32(a + 28, c7);
 #else
     for (; i + MATMUL_F32_LANES <= I; i += MATMUL_F32_LANES)
         for (int j = 0; j < MATMUL_F32_LANES; j++) a[j] = MATMUL_F32_MADD(a[j], x[i+j], kv16_to(w[i+j]));
@@ -130,16 +142,16 @@ static inline float kv16_dot_lanes(const float *x, const uint16_t *w, int I) {
         for (int j = 0; j < h; j++) a[j] += a[j+h];
     return a[0];
 }
-/* y += a * x, the float16 row widened (the float row's own loop: y + a*x, fused). The
- * fusion is spelled out (MATMUL_F32_MADD) rather than left to the compiler, which fuses
- * y += a*x only from -O2 on: at -O1 (the ASan build) the tail would round twice while the
- * F16C body does not. */
+/* y += a * x, the float16 row widened (the float row's own loop: y + a*x, fused). */
 static inline void kv16_axpy(float *y, float a, const uint16_t *x, int n) {
     int i = 0;
-#ifdef KV16_F16C
-    __m256 va = _mm256_set1_ps(a);
-    for (; i + 8 <= n; i += 8)
-        _mm256_storeu_ps(y + i, _mm256_fmadd_ps(va, _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(x + i))), _mm256_loadu_ps(y + i)));
+#ifdef KV16_NEON
+    float32x4_t va = vdupq_n_f32(a);
+    for (; i + 8 <= n; i += 8) {
+        float16x8_t h = vld1q_f16((const __fp16 *)(x + i));
+        vst1q_f32(y + i,     vfmaq_f32(vld1q_f32(y + i),     va, vcvt_f32_f16(vget_low_f16(h))));
+        vst1q_f32(y + i + 4, vfmaq_f32(vld1q_f32(y + i + 4), va, vcvt_f32_f16(vget_high_f16(h))));
+    }
 #endif
     for (; i < n; i++) y[i] = MATMUL_F32_MADD(y[i], a, kv16_to(x[i]));
 }

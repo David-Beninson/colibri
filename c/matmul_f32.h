@@ -7,6 +7,13 @@
 
 #include <math.h>
 #include <stdint.h>
+#ifdef __APPLE__
+#ifndef ACCELERATE_NEW_LAPACK
+#define ACCELERATE_NEW_LAPACK
+#endif
+#include <Accelerate/Accelerate.h>
+#undef I
+#endif
 
 /* Each dot product runs in MATMUL_F32_LANES fixed lanes: lane j accumulates
  * the elements i == j (mod lanes) in order, then the lanes are summed in a
@@ -40,6 +47,15 @@ static inline float dot_f32_lanes(const float *x, const float *w, int I){
 }
 
 static void matmul(float *y, const float *x, const float *W, int S, int I, int O){
+#ifdef __APPLE__
+    if (S > 1) {
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, S, O, I, 1.0f, x, I, W, I, 0.0f, y, O);
+        return;
+    } else if (S == 1) {
+        cblas_sgemv(CblasRowMajor, CblasNoTrans, O, I, 1.0f, W, I, x, 1, 0.0f, y, 1);
+        return;
+    }
+#endif
     #pragma omp parallel for schedule(static)
     for (int o = 0; o < O; o++){
         const float *w = W + (int64_t)o * I;

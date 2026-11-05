@@ -1,12 +1,11 @@
-"""Unified Multimodal, Internet, Memory, Code & Hardware Tools (`src/ai/tools/__init__.py`).
+"""Unified Multimodal, Internet, Memory & Code Tools (`src/ai/tools/__init__.py`).
 
-Aggregates tools across all 6 Desktop Holographic AI Companion domain modules:
+Aggregates tools across all Desktop AI Companion domain modules:
 - `internet.py`    : SSRF-safe web search, webpage content, deep research, ArXiv, Wiki, HN, GitHub, Weather, RSS
-- `vision.py`      : OCR (`extract_text_from_image`), scene description (`describe_image_scene`), person angle tracking (`detect_person_angle`)
+- `vision.py`      : OCR (`extract_text_from_image`), scene description (`describe_image_scene`)
 - `audio.py`/`voice.py`: Speech-to-Text (`transcribe_audio`) and Hebrew/English neural TTS (`text_to_speech`, `speak_text`)
 - `rag.py`         : Private local personal memory & RAG (`query_local_knowledge`, `save_conversation_fact`, `list_saved_facts`)
 - `code_runner.py` : Sandboxed Python math/data execution (`run_python_calculation`)
-- `device.py`      : Raspberry Pi servo tracking & Pepper's Ghost 3D avatar states (`rotate_device`, `set_avatar_state`, `trigger_hologram_effect`)
 """
 from __future__ import annotations
 
@@ -14,17 +13,6 @@ import importlib
 import json
 from typing import Any, Callable, Dict, List, Tuple
 
-from .device import (
-    DEVICE_TOOL_REGISTRY,
-    DEVICE_TOOLS,
-    DEVICE_TOOLS_SCHEMA,
-    get_device_state,
-    rotate_device,
-    rotate_device_servo,
-    set_avatar_state,
-    trigger_avatar_state,
-    trigger_hologram_effect,
-)
 from .internet import (
     INTERNET_TOOLS,
     OPENAI_TOOLS_SCHEMA as INTERNET_TOOLS_SCHEMA,
@@ -55,7 +43,6 @@ try:
         VISION_TOOLS,
         VISION_TOOLS_SCHEMA,
         describe_image_scene,
-        detect_person_angle,
         extract_text_from_image,
     )
 except Exception:  # noqa: BLE001
@@ -64,7 +51,6 @@ except Exception:  # noqa: BLE001
     VISION_TOOLS_SCHEMA = []
     extract_text_from_image = None  # type: ignore[assignment]
     describe_image_scene = None  # type: ignore[assignment]
-    detect_person_angle = None  # type: ignore[assignment]
 
 try:
     from .audio import (  # type: ignore
@@ -95,24 +81,32 @@ except Exception:  # noqa: BLE001
 
 try:
     from .rag import (  # type: ignore
+        CANONICAL_COLLECTIONS,
         RAG_TOOL_REGISTRY,
         RAG_TOOLS,
         RAG_TOOLS_SCHEMA,
+        _resolve_collection,
+        ingest_url_or_note,
         list_saved_facts,
         query_local_knowledge,
         query_memory,
         save_conversation_fact,
         save_fact,
+        scale_recipe,
     )
 except Exception:  # noqa: BLE001
+    CANONICAL_COLLECTIONS = ()  # type: ignore[assignment]
     RAG_TOOLS = []
     RAG_TOOL_REGISTRY = {}
     RAG_TOOLS_SCHEMA = []
+    _resolve_collection = None  # type: ignore[assignment]
     query_memory = None  # type: ignore[assignment]
     save_fact = None  # type: ignore[assignment]
     query_local_knowledge = None  # type: ignore[assignment]
     save_conversation_fact = None  # type: ignore[assignment]
     list_saved_facts = None  # type: ignore[assignment]
+    ingest_url_or_note = None  # type: ignore[assignment]
+    scale_recipe = None  # type: ignore[assignment]
 
 try:
     from .code_runner import (  # type: ignore
@@ -136,21 +130,16 @@ ALIAS_TOOL_NAMES = frozenset(
         "speak_text",
         "query_local_knowledge",
         "save_conversation_fact",
-        "rotate_device_servo",
-        "trigger_avatar_state",
     }
 )
 
-# Core fast-path companion tools (Slot 0) covering memory, voice, motor/avatar, math, weather & search
+# Core fast-path companion tools (Slot 0) covering memory, voice, math, weather & search
 FAST_COMPANION_TOOL_NAMES = (
     "query_memory",
     "save_fact",
     "web_search",
     "weather_lookup",
     "calculate",
-    "rotate_device",
-    "set_avatar_state",
-    "trigger_hologram_effect",
     "text_to_speech",
 )
 
@@ -160,7 +149,7 @@ _CACHED_TOOL_SUITES: Tuple[Dict[str, Callable[..., Any]], List[Dict[str, Any]], 
 def load_all_tool_suites(
     use_cache: bool = True,
 ) -> Tuple[Dict[str, Callable[..., Any]], List[Dict[str, Any]], List[Any]]:
-    """Dynamically merge registries, OpenAI schemas, and tool objects across all 6 domain modules."""
+    """Dynamically merge registries, OpenAI schemas, and tool objects across domain modules."""
     global _CACHED_TOOL_SUITES
     if use_cache and _CACHED_TOOL_SUITES is not None:
         return _CACHED_TOOL_SUITES
@@ -178,7 +167,6 @@ def load_all_tool_suites(
         (".voice", "VOICE_TOOL_REGISTRY", "VOICE_TOOLS_SCHEMA", "VOICE_TOOLS"),
         (".rag", "RAG_TOOL_REGISTRY", "RAG_TOOLS_SCHEMA", "RAG_TOOLS"),
         (".code_runner", "CODE_TOOL_REGISTRY", "CODE_TOOLS_SCHEMA", "CODE_TOOLS"),
-        (".device", "DEVICE_TOOL_REGISTRY", "DEVICE_TOOLS_SCHEMA", "DEVICE_TOOLS"),
     ]
 
     for mod_name, reg_attr, schema_attr, tools_attr in module_specs:
@@ -213,7 +201,7 @@ def load_all_tool_suites(
 
 TOOL_REGISTRY, OPENAI_TOOLS_SCHEMA, ALL_TOOLS = load_all_tool_suites()
 
-# Deduplicated schema list (drops 6 duplicate alias schemas while keeping all 22 unique tools)
+# Deduplicated schema list (drops duplicate alias schemas while keeping all unique tools)
 DEDUPLICATED_TOOLS_SCHEMA: List[Dict[str, Any]] = [
     s
     for s in OPENAI_TOOLS_SCHEMA
@@ -247,7 +235,7 @@ def execute_tool_call(
     arguments: Any,
     max_chars: int = 4000,
 ) -> str:
-    """Execute any registered tool across internet, vision, voice, RAG, code, and device suites."""
+    """Execute any registered tool across internet, vision, voice, RAG, and code suites."""
     registry, _, _ = load_all_tool_suites()
     fn = registry.get(name)
     if fn is None:
@@ -298,9 +286,6 @@ __all__ = [
     "CODE_TOOLS",
     "CODE_TOOL_REGISTRY",
     "CODE_TOOLS_SCHEMA",
-    "DEVICE_TOOLS",
-    "DEVICE_TOOL_REGISTRY",
-    "DEVICE_TOOLS_SCHEMA",
     "OPENAI_TOOLS_SCHEMA",
     "DEDUPLICATED_TOOLS_SCHEMA",
     "FAST_COMPANION_TOOLS_SCHEMA",
@@ -323,7 +308,6 @@ __all__ = [
     "calculate",
     "extract_text_from_image",
     "describe_image_scene",
-    "detect_person_angle",
     "transcribe_audio",
     "text_to_speech",
     "speak_text",
@@ -332,11 +316,9 @@ __all__ = [
     "query_local_knowledge",
     "save_conversation_fact",
     "list_saved_facts",
+    "ingest_url_or_note",
+    "scale_recipe",
+    "CANONICAL_COLLECTIONS",
+    "_resolve_collection",
     "run_python_calculation",
-    "rotate_device",
-    "rotate_device_servo",
-    "set_avatar_state",
-    "trigger_avatar_state",
-    "trigger_hologram_effect",
-    "get_device_state",
 ]

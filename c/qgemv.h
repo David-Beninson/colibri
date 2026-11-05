@@ -25,12 +25,6 @@
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
-#if (defined(__AVX2__) && defined(__FMA__)) || defined(__SSE4_1__)
-#include <immintrin.h>
-#endif
-#if defined(__SSE4_1__)
-#include "sse41_kernels.h"
-#endif
 
 #if defined(__ARM_NEON)
 static inline int32_t dot_i8_16(const int8_t *a, const int8_t *b) {
@@ -75,61 +69,24 @@ static void matmul_q(float *y, const float *x, const int8_t *q, const float *sca
         return;
     }
 #endif
-#if defined(__AVX2__) && defined(__FMA__)
-    /* Hand-vectorized int8->f32 GEMV (gcc does not auto-vectorize the
-     * convert+accumulate chain). 32 weights per iteration, FMA accumulate. */
+#if defined(__ARM_NEON)
     #pragma omp parallel for schedule(static) if(O >= 256)
     for (int o = 0; o < O; o++) {
         const int8_t *w = q + (int64_t)o * I;
-        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
-        __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
-        int i = 0;
-        for (; i + 32 <= I; i += 32) {
-            __m128i b0 = _mm_loadu_si128((const __m128i*)(w + i));
-            __m128i b1 = _mm_loadu_si128((const __m128i*)(w + i + 16));
-            a0 = _mm256_fmadd_ps(_mm256_loadu_ps(x+i),    _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(b0)), a0);
-            a1 = _mm256_fmadd_ps(_mm256_loadu_ps(x+i+8),  _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(b0,8))), a1);
-            a2 = _mm256_fmadd_ps(_mm256_loadu_ps(x+i+16), _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(b1)), a2);
-            a3 = _mm256_fmadd_ps(_mm256_loadu_ps(x+i+24), _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(b1,8))), a3);
-        }
-        a0 = _mm256_add_ps(_mm256_add_ps(a0,a1), _mm256_add_ps(a2,a3));
-        __m128 s = _mm_add_ps(_mm256_castps256_ps128(a0), _mm256_extractf128_ps(a0,1));
-        s = _mm_add_ps(s, _mm_movehl_ps(s,s));
-        s = _mm_add_ss(s, _mm_shuffle_ps(s,s,1));
-        float acc = _mm_cvtss_f32(s);
-        for (; i < I; i++) acc += x[i] * (float)w[i];
-        y[o] = acc * scale[o];
-    }
-#elif defined(__SSE4_1__)
-    /* SSE4.1 tier: one rung below the AVX2 branch above, same shape --
-     * single output row per iteration, no row-interleaving and no runtime
-     * gate (matmul_q has no group scale to gate on, unlike matmul_q_gs's
-     * SSE4.1 branch in gsgemv.h). 128-bit lanes instead of 256-bit: four
-     * accumulators of 4 floats each, 16 weights per iteration where AVX2
-     * manages 32. The multiply-add and the float loads route through
-     * sse41_kernels.h (COLIBRI_FMA / colibri_sse41_loadu_ps), the same
-     * shared primitives olmoe.c's canary uses, instead of an inline copy of
-     * the intrinsics. This tier is new code with no pre-existing
-     * byte-identical output to match, so tests/test_qgemv.c checks it
-     * against a tolerance, not memcmp -- unlike the AVX2 and scalar tiers
-     * above/below. */
-    #pragma omp parallel for schedule(static) if(O >= 256)
-    for (int o = 0; o < O; o++) {
-        const int8_t *w = q + (int64_t)o * I;
-        __m128 a0 = _mm_setzero_ps(), a1 = _mm_setzero_ps();
-        __m128 a2 = _mm_setzero_ps(), a3 = _mm_setzero_ps();
+        float32x4_t a0 = vdupq_n_f32(0.f), a1 = vdupq_n_f32(0.f);
+        float32x4_t a2 = vdupq_n_f32(0.f), a3 = vdupq_n_f32(0.f);
         int i = 0;
         for (; i + 16 <= I; i += 16) {
-            __m128i b0 = _mm_loadu_si128((const __m128i*)(w + i));
-            a0 = COLIBRI_FMA(colibri_sse41_loadu_ps(x+i),    _mm_cvtepi32_ps(_mm_cvtepi8_epi32(b0)), a0);
-            a1 = COLIBRI_FMA(colibri_sse41_loadu_ps(x+i+4),  _mm_cvtepi32_ps(_mm_cvtepi8_epi32(_mm_srli_si128(b0,4))), a1);
-            a2 = COLIBRI_FMA(colibri_sse41_loadu_ps(x+i+8),  _mm_cvtepi32_ps(_mm_cvtepi8_epi32(_mm_srli_si128(b0,8))), a2);
-            a3 = COLIBRI_FMA(colibri_sse41_loadu_ps(x+i+12), _mm_cvtepi32_ps(_mm_cvtepi8_epi32(_mm_srli_si128(b0,12))), a3);
+            int8x16_t b0 = vld1q_s8(w + i);
+            int16x8_t wlo = vmovl_s8(vget_low_s8(b0));
+            int16x8_t whi = vmovl_s8(vget_high_s8(b0));
+            a0 = vfmaq_f32(a0, vld1q_f32(x + i),      vcvtq_f32_s32(vmovl_s16(vget_low_s16(wlo))));
+            a1 = vfmaq_f32(a1, vld1q_f32(x + i + 4),  vcvtq_f32_s32(vmovl_s16(vget_high_s16(wlo))));
+            a2 = vfmaq_f32(a2, vld1q_f32(x + i + 8),  vcvtq_f32_s32(vmovl_s16(vget_low_s16(whi))));
+            a3 = vfmaq_f32(a3, vld1q_f32(x + i + 12), vcvtq_f32_s32(vmovl_s16(vget_high_s16(whi))));
         }
-        a0 = _mm_add_ps(_mm_add_ps(a0,a1), _mm_add_ps(a2,a3));
-        a0 = _mm_add_ps(a0, _mm_movehl_ps(a0,a0));
-        a0 = _mm_add_ss(a0, _mm_shuffle_ps(a0,a0,1));
-        float acc = _mm_cvtss_f32(a0);
+        float32x4_t s = vaddq_f32(vaddq_f32(a0, a2), vaddq_f32(a1, a3));
+        float acc = vaddvq_f32(s);
         for (; i < I; i++) acc += x[i] * (float)w[i];
         y[o] = acc * scale[o];
     }

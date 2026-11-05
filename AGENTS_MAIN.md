@@ -38,7 +38,7 @@ src/ai/
 
 2. **Minimal Context Handoffs**:
    - Never dump raw HTML or unbounded JSON into the conversation state.
-   - Every tool output is stripped of boilerplate/navigation (`ui.web.page` / `trafilatura`) and capped to `COLIBRI_MAX_TOOL_CHARS` (default `4000` chars).
+   - Every tool output is stripped of boilerplate/navigation (`trafilatura` / stdlib HTML parser) and capped to `COLIBRI_MAX_TOOL_CHARS` (default `4000` chars).
    - Prefer `deep_web_research` for multi-source questions: it searches and extracts the top $N$ pages in a **single tool turn**, saving multiple prefill round-trips on `qwen36-35b`.
 
 ---
@@ -67,8 +67,8 @@ All URL fetches enforce strict SSRF protection (`_public_url`: only `http`/`http
 
 | Tool Name | Purpose |
 |---|---|
-| `web_search` | Live web search via `duckduckgo_search` (`DDGS`), SearXNG, or `ui.web.search`. |
-| `fetch_webpage` / `fetch_webpage_content` | SSRF-safe readable article extraction (`trafilatura` + `ui.web.page`) + outbound links. |
+| `web_search` | Live web search via `duckduckgo_search` (`DDGS`), SearXNG, or DuckDuckGo HTML fallback. |
+| `fetch_webpage` / `fetch_webpage_content` | SSRF-safe readable article extraction (`trafilatura` + stdlib HTML parser) + outbound links. |
 | `deep_web_research` | One-shot search + extraction of top $N$ pages to minimize LLM round-trips. |
 | `wikipedia_search` | Authoritative Wikipedia REST/Action API summary and canonical URLs. |
 | `arxiv_search` | ArXiv API (`export.arxiv.org`) paper search with authors, dates, abstracts, and PDF links. |
