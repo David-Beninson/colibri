@@ -318,15 +318,17 @@ class ColibriAgentTestSuite(unittest.TestCase):
     def test_persona_and_bilingual_greetings(self) -> None:
         prompt = build_system_prompt("companion")
         self.assertIn("Jimmy bot", prompt)
-        self.assertIn("ג'ימי בוט", prompt)
         self.assertIn("Jimmies family", prompt)
-        self.assertIn("משפחת ג'ימי", prompt)
-        self.assertIn("he-IL-HilaNeural", prompt)
         self.assertIn("STRICT BREVITY", prompt)
+        self.assertIn("English", prompt)
         self.assertEqual(prompt, COMPANION_PERSONA_PROMPT)
 
-        # Scope creep checks: robotics, servo, holographic cylinder, avatar, face/angle detection purged
-        scope_creep = [
+        # Hebrew strings and scope creep are strictly purged
+        purged = [
+            "ג'ימי בוט",
+            "משפחת ג'ימי",
+            "he-IL-HilaNeural",
+            "עברית",
             "Pepper's Ghost",
             "holographic cylinder",
             "motorized",
@@ -335,7 +337,7 @@ class ColibriAgentTestSuite(unittest.TestCase):
             "trigger_hologram_effect",
             "detect_person_angle",
         ]
-        for term in scope_creep:
+        for term in purged:
             self.assertNotIn(term, prompt)
 
         # Birthday greetings removed from persona module exports
@@ -518,6 +520,8 @@ class ColibriAgentTestSuite(unittest.TestCase):
                         self.assertEqual(req_body.get("cache_slot"), 3)
                         self.assertEqual(req_body.get("context_compaction"), "auto")
                         self.assertIs(req_body.get("preserve_thinking"), True)
+                        self.assertIn("extra_body", req_body)
+                        self.assertEqual(req_body["extra_body"].get("cache_slot"), 3)
                         self.assertEqual(req_body["messages"][0]["role"], "system")
                         self.assertEqual(req_body["messages"][0]["content"], SYSTEM_PROMPT)
 
@@ -620,6 +624,29 @@ class ColibriAgentTestSuite(unittest.TestCase):
                     self.assertIn("[LOCAL MEMORY CONTEXT]", user_msg)
                     self.assertIn("matcha latte", user_msg)
                     self.assertGreaterEqual(len(tokens_seen), 1)
+
+                    # Research query switches to cache_slot=1 even when fast_tool_pruning is False
+                    self.gateway.recorded_requests.clear()
+                    cfg_default = AgentConfig(
+                        base_url=self.base_url,
+                        api_key="test-key",
+                        model="qwen36-35b",
+                        fast_tool_pruning=False,
+                        prefetch_memory=False,
+                    )
+                    run_agent(
+                        "Search arxiv for latest quantum computing papers",
+                        config=cfg_default,
+                        force_stdlib=True,
+                    )
+                    res_reqs = [
+                        r["body"]
+                        for r in self.gateway.recorded_requests
+                        if r["url"].endswith("/chat/completions")
+                    ]
+                    self.assertGreaterEqual(len(res_reqs), 1)
+                    self.assertEqual(res_reqs[0].get("cache_slot"), 1)
+                    self.assertEqual(res_reqs[0].get("extra_body", {}).get("cache_slot"), 1)
 
         # 5. Verify SystemOne zero-token routing skips tool schemas when choice == 'direct'
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -790,6 +817,14 @@ class ColibriAgentTestSuite(unittest.TestCase):
                 large_recipe = "\n".join([f"- {i+1} cups ingredient_{i}" for i in range(40)])
                 scaled = scale_recipe(large_recipe, target_servings=10)
                 self.assertLessEqual(len(scaled), 600)
+
+                # 5. Test unified truncate_output strictly caps length including suffix
+                from src.ai.tools import truncate_output, TOOL_REGISTRY_OBJ
+                truncated = truncate_output("A" * 5000, max_chars=4000)
+                self.assertEqual(len(truncated), 4000)
+                self.assertTrue(truncated.endswith("...[truncated]"))
+                reg_out = TOOL_REGISTRY_OBJ.execute("calculate", {"expression": "2 ** 10"}, max_chars=50)
+                self.assertLessEqual(len(reg_out), 50)
 
     def test_native_langgraph_checkpointer_integration(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -183,7 +183,7 @@ class SystemOneClient:
             instructions="Select the best primary execution strategy to answer this user request.",
             criteria={
                 "direct": "Can be answered directly from general knowledge, casual conversation, or provided memory context without calling external tools.",
-                "companion_fast": "Needs personal memory lookup/save, holographic avatar expression, cylinder servo rotation, voice synthesis, weather, or quick math.",
+                "companion_fast": "Needs personal memory lookup/save, voice synthesis, weather, or quick math.",
                 "web_research": "Needs current internet search, news, live websites, or multi-page synthesis.",
                 "academic": "Needs scientific papers, preprints, or encyclopedic reference (ArXiv / Wikipedia).",
                 "developer": "Needs open-source repositories, code, or HackerNews tech discussions.",

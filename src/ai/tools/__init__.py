@@ -332,9 +332,22 @@ class ToolRegistry:
         except Exception as exc:  # noqa: BLE001
             out = json.dumps({"error": f"Tool {name} raised {type(exc).__name__}: {exc}"})
 
-        if max_chars > 0 and len(out) > max_chars:
-            return out[:max_chars] + "...[truncated]"
-        return out
+        return truncate_output(out, max_chars=max_chars)
+
+
+def truncate_output(text: Any, max_chars: int = 4000) -> str:
+    """Ensure tool output is a string capped at strictly `max_chars` characters.
+
+    The returned string (including the truncation suffix) will never exceed `max_chars`.
+    """
+    raw = text if isinstance(text, str) else json.dumps(text, ensure_ascii=False)
+    if max_chars <= 0 or len(raw) <= max_chars:
+        return raw
+    suffix = "...[truncated]"
+    if max_chars <= len(suffix):
+        return suffix[:max_chars]
+    cut = max_chars - len(suffix)
+    return raw[:cut] + suffix
 
 
 TOOL_REGISTRY_OBJ: ToolRegistry = ToolRegistry.from_modules()
@@ -400,6 +413,7 @@ __all__ = [
     "load_all_tool_suites",
     "get_langchain_tools",
     "execute_tool_call",
+    "truncate_output",
     "web_search",
     "fetch_webpage",
     "fetch_webpage_content",

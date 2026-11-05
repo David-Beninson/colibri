@@ -1066,45 +1066,8 @@ def execute_tool_call(
 ) -> str:
     """Execute a registered tool by name with JSON string or dict arguments.
 
-    Delegates to the unified ToolRegistry if available, or executes against local TOOL_REGISTRY.
+    Delegates directly to the unified ToolRegistry (`TOOL_REGISTRY_OBJ.execute`).
     """
-    try:
-        from . import TOOL_REGISTRY_OBJ
+    from . import TOOL_REGISTRY_OBJ
 
-        return TOOL_REGISTRY_OBJ.execute(name, arguments, max_chars=max_chars)
-    except Exception:
-        fn = TOOL_REGISTRY.get(name)
-        if fn is None:
-            return json.dumps(
-                {"error": f"Unknown tool: {name}", "available_tools": sorted(TOOL_REGISTRY)}
-            )
-
-        if isinstance(arguments, str):
-            clean_args = arguments.strip()
-            if not clean_args:
-                kwargs: Dict[str, Any] = {}
-            else:
-                try:
-                    kwargs = json.loads(clean_args)
-                except Exception as exc:  # noqa: BLE001
-                    return json.dumps({"error": f"Invalid tool JSON arguments for {name}: {exc}"})
-        elif isinstance(arguments, dict):
-            kwargs = dict(arguments)
-        elif arguments is None:
-            kwargs = {}
-        else:
-            kwargs = {}
-
-        if not isinstance(kwargs, dict):
-            return json.dumps(
-                {"error": f"Tool arguments for {name} must decode to a dictionary/object."}
-            )
-
-        try:
-            out = str(fn(**kwargs))
-        except Exception as exc:  # noqa: BLE001
-            out = json.dumps({"error": f"Tool {name} raised {type(exc).__name__}: {exc}"})
-
-        if max_chars > 0 and len(out) > max_chars:
-            return out[:max_chars] + "...[truncated]"
-        return out
+    return TOOL_REGISTRY_OBJ.execute(name, arguments, max_chars=max_chars)

@@ -1,6 +1,6 @@
-# Colibri Desktop Holographic AI Companion Architecture (`AGENTS_MAIN.md`)
+# Colibri Desktop AI Companion Architecture (`AGENTS_MAIN.md`)
 
-This document defines the multi-agent architecture, KV-cache optimization rules, context handoff protocols, 6-domain tool suite, and pre-flight verification standards for the Colibri Desktop Holographic AI Companion (`src/ai/`), purpose-built to run on Colibri's local inference gateway (`coli serve` / `qwen36-35b`) inside a motorized Pepper's Ghost 3D holographic cylinder.
+This document defines the multi-agent architecture, KV-cache optimization rules, context handoff protocols, 5-domain tool suite, and pre-flight verification standards for the Colibri Desktop AI Companion (`src/ai/`), purpose-built to run on Colibri's local inference gateway (`coli serve` / `qwen36-35b`) on Apple Silicon / macOS.
 
 ---
 
@@ -10,7 +10,7 @@ This document defines the multi-agent architecture, KV-cache optimization rules,
 src/ai/
 ├── __init__.py          # Public package exports (AgentConfig, persona, SystemOneClient, 23+ tools, graph runner)
 ├── config.py            # AgentConfig dataclass + auto-detection of served model & context window (/v1/models)
-├── persona.py           # Bilingual (Hebrew/English) Noga (נוגה) companion persona & deterministic system prompt builder
+├── persona.py           # English-only Jimmy bot companion persona & deterministic system prompt builder
 ├── systemone.py         # Client for Colibri's zero-generation decision endpoint (POST /v1/systemone)
 ├── graph.py             # Unified ColibriAgent ReAct runner & pluggable ColibriTransport seam
 │                        # (agent -> tools -> reflect_and_guard -> end) with native SQLite checkpointing
@@ -20,7 +20,7 @@ src/ai/
     ├── __init__.py      # Unified ToolRegistry loader, OPENAI_TOOLS_SCHEMA, and TOOL_REGISTRY
     ├── internet.py      # 11 SSRF-safe internet & utility tools (search, fetch, deep research, ArXiv, Wiki, HN, GitHub, Weather, RSS, math)
     ├── vision.py        # Multilingual OCR (`heb+eng`) and cascading scene description
-    ├── audio.py         # Local OpenAI Whisper STT (`transcribe_audio`) + Edge-TTS bilingual synthesis (`he-IL-HilaNeural`)
+    ├── audio.py         # Local OpenAI Whisper STT (`transcribe_audio`) + Edge-TTS synthesis
     ├── rag.py           # Private local RAG & fact vault persisted at `data/memory_db/` (`query_memory`, `save_fact`, ChromaDB + JSON)
     └── code_runner.py   # AST-sandboxed Python calculation & snippet runner (`run_python_calculation`)
 ```
@@ -30,9 +30,9 @@ src/ai/
 ## 2. Multi-Agent Collaboration & Context Handoffs
 
 1. **Decentralized Node Responsibilities**:
-   - **Router / Classifier (`systemone.py` / `agent` Node)**: Uses Colibri's `POST /v1/systemone` or structured tool-calling on `qwen36-35b` to decide whether a query requires live internet research, personal RAG memory lookup (`query_memory`), vision/OCR, voice synthesis, or hardware servo/avatar actions.
-   - **Multimodal & Hardware Executor (`tools/` / `tools` Node)**: Executes SSRF-safe internet queries, local OCR/vision, Whisper STT / Edge-TTS, local ChromaDB/JSON memory retrieval, AST-sandboxed Python calculations, and Raspberry Pi servo/avatar hooks in parallel (`ThreadPoolExecutor`), returning bounded payloads (`max_chars <= COLIBRI_MAX_TOOL_CHARS`).
-   - **Verifier / Reflection Guard (`reflect_and_guard` Node in `graph.py`)**: Tracks tool step budget (`max_steps`, default `8`) and recovers from malformed `<tool_call>` syntax by nudging final cited synthesis, while pulsing the 3D hologram avatar between `"thinking"` and `"speaking"`.
+   - **Router / Classifier (`systemone.py` / `agent` Node)**: Uses Colibri's `POST /v1/systemone` or structured tool-calling on `qwen36-35b` to decide whether a query requires live internet research, personal RAG memory lookup (`query_memory`), vision/OCR, voice synthesis, or fast companion direct response.
+   - **Multimodal Executor (`tools/` / `tools` Node)**: Executes SSRF-safe internet queries, local OCR/vision, Whisper STT / Edge-TTS, local ChromaDB/JSON memory retrieval, and AST-sandboxed Python calculations in parallel (`ThreadPoolExecutor`), returning bounded payloads (`max_chars <= COLIBRI_MAX_TOOL_CHARS`).
+   - **Verifier / Reflection Guard (`reflect_and_guard` Node in `graph.py`)**: Tracks tool step budget (`max_steps`, default `8`) and recovers from malformed `<tool_call>` syntax by nudging final cited synthesis.
 
 2. **Minimal Context Handoffs**:
    - Never dump raw HTML or unbounded JSON into the conversation state.
@@ -81,36 +81,28 @@ All URL fetches enforce strict SSRF protection (`_public_url`: only `http`/`http
 |---|---|
 | `extract_text_from_image` | Multilingual OCR (`heb+eng` with fallback to `eng`) via `pytesseract` and `Pillow`. |
 | `describe_image_scene` | Cascading visual scene analysis (Gemini Flash -> OpenRouter -> local Colibri vision -> OCR/PIL fallback). |
-| `detect_person_angle` | OpenCV Haar-cascade face detection mapped to a target servo pan angle (`-60°` to `+60°`). |
 
-### 4.3 Voice & Bilingual Audio (`src/ai/tools/audio.py`)
+### 4.3 Voice & Audio (`src/ai/tools/audio.py`)
 | Tool Name | Purpose |
 |---|---|
-| `transcribe_audio` | Local Speech-to-Text via `openai-whisper` with model caching and Hebrew/English detection. |
-| `text_to_speech` / `speak_text` | Neural TTS via `edge-tts` defaulting to `he-IL-HilaNeural` (Hebrew) and `en-US-AriaNeural` (English). |
+| `transcribe_audio` | Local Speech-to-Text via `openai-whisper` with model caching and language detection. |
+| `text_to_speech` / `speak_text` | Neural TTS via `edge-tts` for natural companion voice output. |
 
 ### 4.4 Private Local RAG Memory (`src/ai/tools/rag.py`)
 Persists 100% locally in `data/memory_db/` (and `~/.colibri/memory/`) using ChromaDB (`all-MiniLM-L6-v2`) + JSON vault:
 
 | Tool Name | Purpose |
 |---|---|
-| `query_memory` / `query_local_knowledge` | Semantic + keyword retrieval of personal preferences, favorite songs, dates, and family notes. |
+| `query_memory` / `query_local_knowledge` | Semantic + keyword retrieval of personal preferences, recipes, bookmarks, and family notes. |
 | `save_fact` / `save_conversation_fact` | Dynamically stores new facts and preferences into `data/memory_db/`. |
 | `list_saved_facts` | Lists all stored memories in the local companion vault, optionally filtered by category. |
+| `ingest_url_or_note` | Scrapes and segments ingested content into `recipes_and_food`, `web_bookmarks_and_reads`, or `personal_facts_and_notes`. |
+| `scale_recipe` | Accurately scales recipe ingredients and quantities to `target_servings`. |
 
 ### 4.5 Safe Code & Math Runner (`src/ai/tools/code_runner.py`)
 | Tool Name | Purpose |
 |---|---|
 | `run_python_calculation` | AST-validated sandboxed Python execution (`PythonAstREPLTool` + restricted builtins for `math`, `datetime`, `statistics`). |
-
-### 4.6 Hardware & Pepper's Ghost 3D Avatar (`src/ai/tools/device.py`)
-Communicates with the Raspberry Pi bridge (`COLIBRI_RPI_URL`) with offline simulation persistence (`~/.colibri/memory/device_state.json`):
-
-| Tool Name | Purpose |
-|---|---|
-| `rotate_device` / `rotate_device_servo` | Clamps angle to `[-180, 180]` degrees and rotates the motorized holographic cylinder base. |
-| `set_avatar_state` / `trigger_avatar_state` | Sets the 3D hologram state (`idle`, `thinking`, `speaking`, `listening`, `happy`, `birthday`, `love`, `waving`), emotion, and subtitle. |
-| `trigger_hologram_effect` | Triggers visual overlays (`birthday_confetti`, `floating_hearts`, `starlight_glow`, `ambient_pulse`) and cylinder LED ring RGB color. |
 
 ---
 

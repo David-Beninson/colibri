@@ -232,6 +232,18 @@ class ColibriSqliteCheckpointer(BaseCheckpointSaver):
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS checkpoint_writes (
+                thread_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                value_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (thread_id, task_id, channel)
+            )
+            """
+        )
         return conn
 
     @staticmethod
@@ -337,8 +349,24 @@ class ColibriSqliteCheckpointer(BaseCheckpointSaver):
         writes: Sequence[Tuple[str, Any]],
         task_id: str,
     ) -> None:
-        """LangGraph task write staging."""
-        pass
+        """LangGraph task write staging protocol."""
+        configurable = config.get("configurable", {}) if isinstance(config, dict) else {}
+        tid = str(configurable.get("thread_id") or "default")
+        now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        try:
+            with self._connect() as conn:
+                for channel, value in writes:
+                    val_str = json.dumps(value, ensure_ascii=False) if not isinstance(value, str) else value
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO checkpoint_writes (thread_id, task_id, channel, value_json, created_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (tid, str(task_id), str(channel), val_str, now_iso),
+                    )
+                conn.commit()
+        except Exception:
+            pass
 
     def get_tuple(self, config: Dict[str, Any]) -> Optional[CheckpointTuple]:
         """LangGraph native checkpoint restoration protocol."""
@@ -497,11 +525,10 @@ def _load_tools_registry(
 
 
 def _truncate_output(text: Any, max_chars: int) -> str:
-    """Ensure tool output is a string capped at `max_chars` characters."""
-    raw = text if isinstance(text, str) else json.dumps(text, ensure_ascii=False)
-    if max_chars > 0 and len(raw) > max_chars:
-        return raw[:max_chars] + f"\n...[truncated to {max_chars} chars]"
-    return raw
+    """Ensure tool output is a string capped at strictly `max_chars` characters."""
+    from .tools import truncate_output
+
+    return truncate_output(text, max_chars=max_chars)
 
 
 def _salvage_inline_tool_calls(content: str) -> List[Dict[str, Any]]:
@@ -645,7 +672,10 @@ class HttpTransport(ColibriTransport):
             "max_tokens": config.max_tokens,
             "stream": bool(stream_tokens),
         }
-        payload.update(_colibri_extra_body(config, active_slot=active_slot))
+        extra = _colibri_extra_body(config, active_slot=active_slot)
+        payload.update(extra)
+        if extra:
+            payload["extra_body"] = dict(extra)
         if tools:
             payload["tools"] = list(tools)
             payload["tool_choice"] = "auto"
@@ -935,30 +965,21 @@ class ColibriAgent:
                 }
 
         # Optimization: Two-Slot Prefix Split (Slot 0 = Fast Companion tools, Slot 1 = Full tools)
+        needs_research = _needs_full_research_suite(last_user_text)
         use_fast_tools = bool(
             getattr(self.config, "fast_tool_pruning", False)
-            and not _needs_full_research_suite(last_user_text)
+            and not needs_research
         )
-        active_slot = (
-            self.config.cache_slot
-            if not (getattr(self.config, "fast_tool_pruning", False) and not use_fast_tools)
-            else getattr(self.config, "research_cache_slot", self.config.cache_slot)
-        )
+        research_slot = getattr(self.config, "research_cache_slot", 1)
+        active_slot = research_slot if needs_research else self.config.cache_slot
 
         # Optimization: Optional SystemOne zero-token routing (`use_systemone_routing`)
-        skip_tools_via_sys1 = False
-        if getattr(self.config, "use_systemone_routing", False) and last_user_text and not getattr(self.config, "is_ollama_or_metal", False):
-            try:
-                from .systemone import SystemOneClient
-
-                decision = SystemOneClient(config=self.config).route_query(last_user_text)
-                if decision.choice == "direct" and decision.confidence >= 0.65:
-                    skip_tools_via_sys1 = True
-                elif decision.choice in ("companion_fast", "weather_or_math"):
-                    use_fast_tools = True
-                    active_slot = self.config.cache_slot
-            except Exception:  # noqa: BLE001
-                pass
+        skip_tools_via_sys1 = bool(
+            getattr(self.config, "use_systemone_routing", False)
+            and last_user_text
+            and not getattr(self.config, "is_ollama_or_metal", False)
+            and intent == "conversation"
+        )
 
         # Ensure static system prompt is always byte-identical at index 0 for KV cache prefix reuse
         if not input_messages or input_messages[0].get("role") != "system":
@@ -1190,21 +1211,187 @@ def build_internet_agent_graph(
     stream: bool = False,
     checkpointer: Optional[Any] = None,
     transport: Optional[ColibriTransport] = None,
-) -> ColibriAgent:
-    """Build or return the unified `ColibriAgent` runner.
+    force_stdlib: bool = False,
+) -> Any:
+    """Build or return the unified `ColibriAgent` runner or compiled StateGraph.
 
-    Provides the complete StateGraph `.invoke()` and `.run()` execution pipeline
-    with stateful KV-cache prefixing, zero-generation SystemOne routing,
-    and native SQLite checkpointing.
+    Uses `langgraph.graph.StateGraph` compiled with `checkpointer` when
+    installed, or returns `ColibriAgent` with native SQLite checkpointing
+    and StateGraph-compatible execution interface.
     """
-    return ColibriAgent(
-        config=config,
-        on_tool_call=on_tool_call,
-        on_token=on_token,
-        stream=stream,
-        checkpointer=checkpointer,
-        transport=transport,
+    cfg = config or AgentConfig()
+    active_cp = checkpointer or ColibriSqliteCheckpointer()
+    if not _LANGGRAPH_AVAILABLE or force_stdlib:
+        return ColibriAgent(
+            config=cfg,
+            on_tool_call=on_tool_call,
+            on_token=on_token,
+            stream=stream,
+            checkpointer=active_cp,
+            transport=transport,
+        )
+
+    use_fast = bool(getattr(cfg, "fast_tool_pruning", False))
+    _, _, get_lc_tools = _load_tools_registry(fast_mode=use_fast)
+    lc_tools = get_lc_tools()
+    extra_body = _colibri_extra_body(cfg)
+
+    llm = ChatOpenAI(
+        base_url=cfg.base_url,
+        api_key=cfg.api_key or "colibri",
+        model=cfg.model,
+        temperature=cfg.temperature,
+        max_tokens=cfg.max_tokens,
+        timeout=cfg.request_timeout,
+        streaming=bool(stream or on_token is not None or getattr(cfg, "stream_tts", False)),
+        extra_body=extra_body,
     )
+    llm_with_tools = llm.bind_tools(lc_tools) if lc_tools else llm
+
+    def agent_node(state: InternetAgentState) -> Dict[str, Any]:
+        msgs = list(state.get("messages") or [])
+        if not msgs or not isinstance(msgs[0], SystemMessage):
+            msgs = [SystemMessage(content=SYSTEM_PROMPT), *msgs]
+
+        force_finalize = bool(state.get("force_finalize", False))
+        active_llm = llm if force_finalize else llm_with_tools
+        if stream or on_token is not None or getattr(cfg, "stream_tts", False):
+            acc_chunk = None
+            for chunk in active_llm.stream(msgs):
+                c_text = str(getattr(chunk, "content", "") or "")
+                if c_text and on_token is not None:
+                    on_token(c_text)
+                acc_chunk = chunk if acc_chunk is None else acc_chunk + chunk
+            ai_msg = (
+                AIMessage(
+                    content=str(getattr(acc_chunk, "content", "") or ""),
+                    tool_calls=list(getattr(acc_chunk, "tool_calls", None) or []),
+                )
+                if acc_chunk is not None
+                else active_llm.invoke(msgs)
+            )
+        else:
+            ai_msg = active_llm.invoke(msgs)
+
+        if (
+            isinstance(ai_msg, AIMessage)
+            and not getattr(ai_msg, "tool_calls", None)
+            and not force_finalize
+            and isinstance(ai_msg.content, str)
+        ):
+            salvaged = _salvage_inline_tool_calls(ai_msg.content)
+            if salvaged:
+                ai_msg.tool_calls = [
+                    {
+                        "id": tc["id"],
+                        "name": tc["name"],
+                        "args": tc["args"],
+                        "type": "tool_call",
+                    }
+                    for tc in salvaged
+                ]
+
+        updates: List[BaseMessage] = []
+        if not state.get("messages") or not isinstance(state["messages"][0], SystemMessage):
+            updates.append(SystemMessage(content=SYSTEM_PROMPT))
+        updates.append(ai_msg)
+        return {"messages": updates}
+
+    def tools_node(state: InternetAgentState) -> Dict[str, Any]:
+        msgs = state.get("messages") or []
+        last_msg = msgs[-1] if msgs else None
+        raw_calls = getattr(last_msg, "tool_calls", None) or []
+
+        normalized: List[Dict[str, Any]] = []
+        for idx, tc in enumerate(raw_calls):
+            normalized.append(
+                {
+                    "id": str(tc.get("id") or f"call_{idx}"),
+                    "name": str(tc.get("name") or ""),
+                    "args": tc.get("args", {}),
+                }
+            )
+
+        exec_results = _execute_tool_calls_parallel(
+            normalized,
+            max_chars=cfg.max_tool_chars,
+            on_tool_call=on_tool_call,
+        )
+        tool_messages: List[BaseMessage] = [
+            ToolMessage(
+                content=res["content"],
+                tool_call_id=res["tool_call_id"],
+                name=res["name"],
+            )
+            for res in exec_results
+        ]
+        prev_log = list(state.get("tool_calls_log") or [])
+        prev_log.extend(exec_results)
+        step_count = int(state.get("step_count") or 0) + 1
+        return {
+            "messages": tool_messages,
+            "step_count": step_count,
+            "tool_calls_log": prev_log,
+        }
+
+    def reflect_and_guard_node(state: InternetAgentState) -> Dict[str, Any]:
+        step_count = int(state.get("step_count") or 0)
+        max_steps = int(state.get("max_steps") or cfg.max_iterations)
+        msgs = state.get("messages") or []
+        last_msg = msgs[-1] if msgs else None
+        last_content = str(getattr(last_msg, "content", "") or "")
+
+        if step_count >= max_steps or "<tool_call>" in last_content:
+            return {
+                "force_finalize": True,
+                "messages": [HumanMessage(content=_SYNTHESIS_NUDGE)],
+            }
+        return {"force_finalize": False}
+
+    def route_after_agent(state: InternetAgentState) -> str:
+        msgs = state.get("messages") or []
+        last_msg = msgs[-1] if msgs else None
+        force_finalize = bool(state.get("force_finalize", False))
+        if force_finalize:
+            return END
+        if getattr(last_msg, "tool_calls", None):
+            return "tools"
+        last_content = str(getattr(last_msg, "content", "") or "")
+        if "<tool_call>" in last_content:
+            return "reflect_and_guard"
+        return END
+
+    def intent_router_node(state: InternetAgentState) -> Dict[str, Any]:
+        msgs = list(state.get("messages") or [])
+        last_user_content = ""
+        for m in reversed(msgs):
+            if isinstance(m, HumanMessage):
+                last_user_content = str(getattr(m, "content", "") or "")
+                break
+        detected_intent = state.get("intent") or classify_user_intent(last_user_content, cfg)
+        return {"intent": detected_intent}
+
+    graph = StateGraph(InternetAgentState)
+    graph.add_node("intent_router", intent_router_node)
+    graph.add_node("agent", agent_node)
+    graph.add_node("tools", tools_node)
+    graph.add_node("reflect_and_guard", reflect_and_guard_node)
+
+    graph.add_edge(START, "intent_router")
+    graph.add_edge("intent_router", "agent")
+    graph.add_conditional_edges(
+        "agent",
+        route_after_agent,
+        {
+            "tools": "tools",
+            "reflect_and_guard": "reflect_and_guard",
+            END: END,
+        },
+    )
+    graph.add_edge("tools", "reflect_and_guard")
+    graph.add_edge("reflect_and_guard", "agent")
+
+    return graph.compile(checkpointer=active_cp)
 
 
 def run_agent(
