@@ -19,7 +19,7 @@ src/ai/
 ├── cli.py               # Interactive & one-shot CLI entry point (/tools, /birthday, /memory, /voice, /speak, /ocr)
 ├── test_agent.py        # Self-contained unit test suite covering all companion domains, persona, SSRF, and ColibriAgent
 └── tools/
-    ├── __init__.py      # Unified ToolRegistry loader, OPENAI_TOOLS_SCHEMA, and TOOL_REGISTRY
+    ├── __init__.py      # Unified ToolSuite / ToolRegistry loader, OPENAI_TOOLS_SCHEMA, and TOOL_REGISTRY
     ├── internet.py      # 11 SSRF-safe internet & utility tools (search, fetch, deep research, ArXiv, Wiki, HN, GitHub, Weather, RSS, math)
     ├── vision.py        # Multilingual OCR (`heb+eng`) and cascading scene description
     ├── audio.py         # Local OpenAI Whisper STT (`transcribe_audio`) + Edge-TTS synthesis

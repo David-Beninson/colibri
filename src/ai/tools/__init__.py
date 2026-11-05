@@ -9,8 +9,11 @@ Aggregates tools across all Desktop AI Companion domain modules:
 """
 from __future__ import annotations
 
+import concurrent.futures
 import importlib
 import json
+import re
+import time
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from .internet import (
@@ -135,8 +138,33 @@ FAST_COMPANION_TOOL_NAMES = (
     "text_to_speech",
 )
 
-class ToolRegistry:
-    """Consolidated deep tool registry for companion tools, OpenAI function schemas, and execution."""
+# Output truncation bounds
+COLIBRI_MAX_TOOL_CHARS: int = 4000
+
+# Regexes for inline XML tool call salvaging and keyword-based tool pruning heuristics
+_MALFORMED_TOOL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*(?:</tool_call>|$)", re.DOTALL)
+
+_RESEARCH_KEYWORDS_RE = re.compile(
+    r"\b(arxiv|wikipedia|wiki|hackernews|hacker news|github|repo|rss|feed|ocr|image|photo|camera|python|script|deep research|article|http://|https://)\b",
+    re.IGNORECASE,
+)
+
+_URL_INGEST_RE = re.compile(
+    r"(https?://\S+|\b(?:ingest|scrape|bookmark|save\s+(?:this\s+)?(?:url|link|recipe|article|note)|"
+    r"remember\s+this\s+(?:recipe|url|link|note)|שמור\s+(?:את\s+)?(?:המתכון|הקישור|הלינק))\b)",
+    re.IGNORECASE,
+)
+
+_RECIPE_SCALING_RE = re.compile(
+    r"\b(scale\s+(?:the\s+)?recipe|scale\s+to\s+\d+|for\s+\d+\s+(?:servings?|people|guests|portions?)|"
+    r"double\s+the\s+(?:recipe|ingredients?)|halve\s+the\s+(?:recipe|ingredients?)|"
+    r"convert\s+(?:servings?|ingredients?)|הכפל\s+את\s+המתכון|ל-\d+\s+מנות)\b",
+    re.IGNORECASE,
+)
+
+
+class ToolSuite:
+    """Consolidated deep tool suite for companion tools, OpenAI function schemas, and execution."""
 
     def __init__(
         self,
@@ -152,8 +180,8 @@ class ToolRegistry:
     def from_modules(
         cls,
         module_specs: Optional[List[Tuple[str, str, str, str]]] = None,
-    ) -> "ToolRegistry":
-        """Build and populate a ToolRegistry by scanning tool modules."""
+    ) -> "ToolSuite":
+        """Build and populate a ToolSuite by scanning tool modules."""
         if module_specs is None:
             module_specs = [
                 (".internet", "TOOL_REGISTRY", "OPENAI_TOOLS_SCHEMA", "INTERNET_TOOLS"),
@@ -287,11 +315,69 @@ class ToolRegistry:
             selected.append(getattr(t, "_lc", t))
         return selected
 
-    def execute(
+    @staticmethod
+    def salvage_inline_calls(content: str) -> List[Dict[str, Any]]:
+        """Salvage `<tool_call>{...}</tool_call>` blocks from raw text."""
+        if not content or "<tool_call>" not in content:
+            return []
+        salvaged: List[Dict[str, Any]] = []
+        for idx, match in enumerate(_MALFORMED_TOOL_RE.finditer(content)):
+            raw_json = match.group(1).strip()
+            try:
+                obj = json.loads(raw_json)
+                if isinstance(obj, dict):
+                    fn_name = obj.get("name") or (obj.get("function") or {}).get("name")
+                    if isinstance(fn_name, str) and fn_name:
+                        args = obj.get("arguments", obj.get("args", {}))
+                        if isinstance(args, str):
+                            try:
+                                args = json.loads(args)
+                            except Exception:
+                                pass
+                        salvaged.append(
+                            {
+                                "id": f"salvaged_call_{idx}",
+                                "name": fn_name,
+                                "args": args if isinstance(args, dict) else {},
+                            }
+                        )
+            except Exception:
+                continue
+        return salvaged
+
+    @classmethod
+    def needs_full_research_suite(cls, prompt_text: str) -> bool:
+        """Return True if prompt requires full research/vision/code tools beyond fast companion tools."""
+        if not prompt_text:
+            return False
+        clean = prompt_text.strip()
+        if _URL_INGEST_RE.search(clean) or _RECIPE_SCALING_RE.search(clean):
+            return True
+        return bool(_RESEARCH_KEYWORDS_RE.search(clean))
+
+    def prune_for_prompt(
+        self_or_cls,
+        prompt_text: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Keyword-based tool pruning heuristic returning schemas tailored to user prompt."""
+        if isinstance(self_or_cls, type):
+            suite = TOOL_SUITE_OBJ
+            text = prompt_text if prompt_text is not None else ""
+        elif isinstance(self_or_cls, str) and prompt_text is None:
+            suite = TOOL_SUITE_OBJ
+            text = self_or_cls
+        else:
+            suite = self_or_cls
+            text = prompt_text or ""
+        if suite.needs_full_research_suite(text):
+            return suite.deduplicated_schemas
+        return suite.fast_companion_schemas
+
+    def execute_single(
         self,
         name: str,
         args: Union[str, Dict[str, Any], Any] = None,
-        max_chars: int = 4000,
+        max_chars: int = COLIBRI_MAX_TOOL_CHARS,
     ) -> str:
         """Execute a registered tool by name with JSON string or dict arguments.
 
@@ -334,8 +420,108 @@ class ToolRegistry:
 
         return truncate_output(out, max_chars=max_chars)
 
+    def execute(
+        self,
+        calls_or_content: Union[str, Sequence[Dict[str, Any]], Dict[str, Any]],
+        parallel: Union[bool, Any] = True,
+        max_chars: int = COLIBRI_MAX_TOOL_CHARS,
+        on_tool_call: Optional[Callable[[Dict[str, Any], str, float], None]] = None,
+    ) -> Union[List[Dict[str, Any]], str]:
+        """Clean unified execution method supporting parallel execution, XML salvaging, and legacy calls.
 
-def truncate_output(text: Any, max_chars: int = 4000) -> str:
+        - If given a sequence of tool calls: executes sequentially or concurrently in parallel.
+        - If given raw content with `<tool_call>` XML: salvages inline calls and executes them.
+        - If given a single tool name with args: executes legacy single tool returning str.
+        """
+        if isinstance(calls_or_content, str):
+            if "<tool_call>" in calls_or_content:
+                parsed_calls = self.salvage_inline_calls(calls_or_content)
+                return self._execute_calls(
+                    parsed_calls,
+                    parallel=parallel if isinstance(parallel, bool) else True,
+                    max_chars=max_chars,
+                    on_tool_call=on_tool_call,
+                )
+            if calls_or_content in self._registry and not isinstance(parallel, bool):
+                return self.execute_single(calls_or_content, args=parallel, max_chars=max_chars)
+
+            parsed_calls = self.salvage_inline_calls(calls_or_content)
+            return self._execute_calls(
+                parsed_calls,
+                parallel=parallel if isinstance(parallel, bool) else True,
+                max_chars=max_chars,
+                on_tool_call=on_tool_call,
+            )
+
+        if isinstance(calls_or_content, dict):
+            calls_list = [calls_or_content]
+        elif isinstance(calls_or_content, (list, tuple)):
+            calls_list = list(calls_or_content)
+        else:
+            calls_list = []
+
+        return self._execute_calls(
+            calls_list,
+            parallel=parallel if isinstance(parallel, bool) else True,
+            max_chars=max_chars,
+            on_tool_call=on_tool_call,
+        )
+
+    def _execute_calls(
+        self,
+        calls: Sequence[Dict[str, Any]],
+        parallel: bool = True,
+        max_chars: int = COLIBRI_MAX_TOOL_CHARS,
+        on_tool_call: Optional[Callable[[Dict[str, Any], str, float], None]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Execute a sequence of tool calls either concurrently in a ThreadPoolExecutor or sequentially."""
+        if not calls:
+            return []
+
+        def _worker(item: Tuple[int, Dict[str, Any]]) -> Dict[str, Any]:
+            idx, tc = item
+            t0 = time.monotonic()
+            tc_id = str(tc.get("id") or tc.get("tool_call_id") or f"call_{idx}")
+            name = str(tc.get("name") or (tc.get("function") or {}).get("name") or "")
+            args = tc.get("args")
+            if args is None:
+                args = tc.get("arguments")
+            if args is None:
+                fn_obj = tc.get("function") or {}
+                args = fn_obj.get("arguments", fn_obj.get("args", {}))
+            if args is None:
+                args = {}
+
+            output = self.execute_single(name, args, max_chars=max_chars)
+            elapsed = round(time.monotonic() - t0, 3)
+
+            if on_tool_call is not None:
+                try:
+                    on_tool_call({"id": tc_id, "name": name, "args": args}, output, elapsed)
+                except Exception:
+                    pass
+
+            return {
+                "tool_call_id": tc_id,
+                "name": name,
+                "args": args,
+                "content": output,
+                "elapsed_s": elapsed,
+            }
+
+        indexed = list(enumerate(calls))
+        if parallel and len(calls) > 1:
+            max_workers = min(len(calls), 8)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+                return list(pool.map(_worker, indexed))
+        return [_worker(item) for item in indexed]
+
+
+# 100% backwards compatibility alias
+ToolRegistry = ToolSuite
+
+
+def truncate_output(text: Any, max_chars: int = COLIBRI_MAX_TOOL_CHARS) -> str:
     """Ensure tool output is a string capped at strictly `max_chars` characters.
 
     The returned string (including the truncation suffix) will never exceed `max_chars`.
@@ -350,38 +536,40 @@ def truncate_output(text: Any, max_chars: int = 4000) -> str:
     return raw[:cut] + suffix
 
 
-TOOL_REGISTRY_OBJ: ToolRegistry = ToolRegistry.from_modules()
+TOOL_SUITE_OBJ: ToolSuite = ToolSuite.from_modules()
+TOOL_REGISTRY_OBJ: ToolSuite = TOOL_SUITE_OBJ
 
 
 def load_all_tool_suites(
     use_cache: bool = True,
 ) -> Tuple[Dict[str, Callable[..., Any]], List[Dict[str, Any]], List[Any]]:
     """Dynamically merge registries, OpenAI schemas, and tool objects across domain modules."""
-    global TOOL_REGISTRY_OBJ
-    if not use_cache or not TOOL_REGISTRY_OBJ.registry:
-        TOOL_REGISTRY_OBJ = ToolRegistry.from_modules()
-    return TOOL_REGISTRY_OBJ.registry, TOOL_REGISTRY_OBJ.schemas, TOOL_REGISTRY_OBJ.tools
+    global TOOL_SUITE_OBJ, TOOL_REGISTRY_OBJ
+    if not use_cache or not TOOL_SUITE_OBJ.registry:
+        TOOL_SUITE_OBJ = ToolSuite.from_modules()
+        TOOL_REGISTRY_OBJ = TOOL_SUITE_OBJ
+    return TOOL_SUITE_OBJ.registry, TOOL_SUITE_OBJ.schemas, TOOL_SUITE_OBJ.tools
 
 
-TOOL_REGISTRY: Dict[str, Callable[..., Any]] = TOOL_REGISTRY_OBJ.registry
-OPENAI_TOOLS_SCHEMA: List[Dict[str, Any]] = TOOL_REGISTRY_OBJ.schemas
-ALL_TOOLS: List[Any] = TOOL_REGISTRY_OBJ.tools
-DEDUPLICATED_TOOLS_SCHEMA: List[Dict[str, Any]] = TOOL_REGISTRY_OBJ.deduplicated_schemas
-FAST_COMPANION_TOOLS_SCHEMA: List[Dict[str, Any]] = TOOL_REGISTRY_OBJ.fast_companion_schemas
+TOOL_REGISTRY: Dict[str, Callable[..., Any]] = TOOL_SUITE_OBJ.registry
+OPENAI_TOOLS_SCHEMA: List[Dict[str, Any]] = TOOL_SUITE_OBJ.schemas
+ALL_TOOLS: List[Any] = TOOL_SUITE_OBJ.tools
+DEDUPLICATED_TOOLS_SCHEMA: List[Dict[str, Any]] = TOOL_SUITE_OBJ.deduplicated_schemas
+FAST_COMPANION_TOOLS_SCHEMA: List[Dict[str, Any]] = TOOL_SUITE_OBJ.fast_companion_schemas
 
 
 def get_langchain_tools(fast_mode: bool = False, deduplicate: bool = False) -> List[Any]:
     """Return registered tools unwrapped for LangChain `bind_tools()`."""
-    return TOOL_REGISTRY_OBJ.get_langchain_tools(fast_mode=fast_mode, deduplicate=deduplicate)
+    return TOOL_SUITE_OBJ.get_langchain_tools(fast_mode=fast_mode, deduplicate=deduplicate)
 
 
 def execute_tool_call(
     name: str,
     arguments: Any = None,
-    max_chars: int = 4000,
+    max_chars: int = COLIBRI_MAX_TOOL_CHARS,
 ) -> str:
     """Execute any registered tool across internet, vision, audio, RAG, and code suites."""
-    return TOOL_REGISTRY_OBJ.execute(name, arguments, max_chars=max_chars)
+    return TOOL_SUITE_OBJ.execute_single(name, arguments, max_chars=max_chars)
 
 
 __all__ = [
@@ -409,6 +597,9 @@ __all__ = [
     "TOOL_REGISTRY",
     "TOOL_REGISTRY_OBJ",
     "ToolRegistry",
+    "ToolSuite",
+    "TOOL_SUITE_OBJ",
+    "COLIBRI_MAX_TOOL_CHARS",
     "SentenceTTSStreamer",
     "load_all_tool_suites",
     "get_langchain_tools",

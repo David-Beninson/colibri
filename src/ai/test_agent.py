@@ -53,8 +53,13 @@ from src.ai.session import (
 from src.ai.systemone import SystemOneClient
 from src.ai.tools import (
     CANONICAL_COLLECTIONS,
+    COLIBRI_MAX_TOOL_CHARS,
     OPENAI_TOOLS_SCHEMA,
     TOOL_REGISTRY,
+    TOOL_REGISTRY_OBJ,
+    TOOL_SUITE_OBJ,
+    ToolRegistry,
+    ToolSuite,
     _resolve_collection,
     calculate,
     describe_image_scene,
@@ -1367,6 +1372,100 @@ class ColibriAgentTestSuite(unittest.TestCase):
         self.assertEqual(turn_result.context.slot, 0)
         self.assertEqual(gw.chat_calls[0]["slot"], 0)
         self.assertEqual(gw.chat_calls[0]["messages"][0]["role"], "system")
+
+    def test_tool_suite_consolidation_execution_concurrency_and_pruning(self) -> None:
+        """Verify deep ToolSuite evolution: direct execution, concurrency, XML salvaging, and pruning."""
+        # 1. Backwards compatibility alias and global instances
+        self.assertIs(ToolRegistry, ToolSuite)
+        self.assertIs(TOOL_REGISTRY_OBJ, TOOL_SUITE_OBJ)
+        self.assertIsInstance(TOOL_SUITE_OBJ, ToolSuite)
+        self.assertEqual(COLIBRI_MAX_TOOL_CHARS, 4000)
+
+        suite = ToolSuite.from_modules()
+        self.assertGreater(len(suite), 15)
+
+        # 2. Direct single execution and backwards-compatible calling signatures
+        out_single = suite.execute_single("calculate", {"expression": "12 * 12"})
+        self.assertEqual(json.loads(out_single)["result"], 144)
+
+        # Legacy execute(name, args)
+        out_legacy = suite.execute("calculate", {"expression": "9 * 9"})
+        self.assertEqual(json.loads(out_legacy)["result"], 81)
+
+        # Unified execute(calls_list) returning List[Dict[str, Any]]
+        calls_result = suite.execute([{"name": "calculate", "args": {"expression": "25 * 4"}}])
+        self.assertIsInstance(calls_result, list)
+        self.assertEqual(len(calls_result), 1)
+        self.assertEqual(calls_result[0]["name"], "calculate")
+        self.assertEqual(json.loads(calls_result[0]["content"])["result"], 100)
+        self.assertIn("call_", calls_result[0]["tool_call_id"])
+        self.assertGreaterEqual(calls_result[0]["elapsed_s"], 0)
+
+        # Truncation bounds
+        truncated_res = suite.execute(
+            [{"name": "calculate", "args": {"expression": "10**25"}}],
+            max_chars=18,
+        )
+        self.assertLessEqual(len(truncated_res[0]["content"]), 18)
+        self.assertTrue(truncated_res[0]["content"].endswith("...[truncated]"))
+
+        # 3. Parallel concurrency using ThreadPoolExecutor
+        parallel_calls = [
+            {"id": f"c_{i}", "name": "calculate", "args": {"expression": f"{i} * 10"}}
+            for i in range(5)
+        ]
+        parallel_results = suite.execute(parallel_calls, parallel=True)
+        self.assertEqual(len(parallel_results), 5)
+        self.assertEqual([r["tool_call_id"] for r in parallel_results], [f"c_{i}" for i in range(5)])
+        self.assertEqual([json.loads(r["content"])["result"] for r in parallel_results], [0, 10, 20, 30, 40])
+
+        # 4. Inline XML <tool_call> salvaging
+        xml_content = (
+            "I will evaluate this for you:\n"
+            "<tool_call>{\"name\": \"calculate\", \"arguments\": {\"expression\": \"7 * 8\"}}</tool_call>\n"
+            "And the second step:\n"
+            "<tool_call>{\"name\": \"calculate\", \"args\": {\"expression\": \"100 - 35\"}}</tool_call>"
+        )
+        salvaged = ToolSuite.salvage_inline_calls(xml_content)
+        self.assertEqual(len(salvaged), 2)
+        self.assertEqual(salvaged[0]["name"], "calculate")
+        self.assertEqual(salvaged[0]["args"], {"expression": "7 * 8"})
+        self.assertEqual(salvaged[1]["args"], {"expression": "100 - 35"})
+
+        # Salvage and execution via unified suite.execute(content)
+        salvaged_exec = suite.execute(xml_content)
+        self.assertEqual(len(salvaged_exec), 2)
+        self.assertEqual(json.loads(salvaged_exec[0]["content"])["result"], 56)
+        self.assertEqual(json.loads(salvaged_exec[1]["content"])["result"], 65)
+
+        # 5. Keyword-based tool pruning heuristics
+        fast_companion = suite.prune_for_prompt("What is the weather in Haifa today?")
+        self.assertEqual(len(fast_companion), 6)
+
+        research_schemas = suite.prune_for_prompt("Search arxiv for transformer architectures")
+        self.assertEqual(len(research_schemas), 20)
+
+        ingest_schemas = suite.prune_for_prompt("Bookmark this link https://google.com")
+        self.assertEqual(len(ingest_schemas), 20)
+
+        scaling_schemas = suite.prune_for_prompt("Scale the recipe to 12 servings")
+        self.assertEqual(len(scaling_schemas), 20)
+
+        # Classmethod invocation check
+        cls_pruned = ToolSuite.prune_for_prompt("Hi Jimmy, how are you doing?")
+        self.assertEqual(len(cls_pruned), 6)
+
+        # 6. ColibriAgent delegation verification
+        agent = ColibriAgent(
+            config=AgentConfig(base_url="http://mock.internal/v1"),
+            transport=InMemoryGatewayAdapter(),
+            tool_suite=suite,
+        )
+        self.assertIs(agent.tool_suite, suite)
+        self.assertIs(agent.tool_registry, suite)
+        delegated_results = agent.execute_tools([{"name": "calculate", "args": {"expression": "3 + 7"}}])
+        self.assertEqual(len(delegated_results), 1)
+        self.assertEqual(json.loads(delegated_results[0]["content"])["result"], 10)
 
 
 if __name__ == "__main__":

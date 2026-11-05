@@ -37,6 +37,7 @@ from .session import (
     SqliteSessionStore,
     get_session_history,
 )
+from .tools import TOOL_SUITE_OBJ, ToolSuite
 
 try:
     from langchain_core.messages import (
@@ -191,15 +192,6 @@ def classify_user_intent(prompt_text: str, config: Optional[AgentConfig] = None)
 ColibriSqliteCheckpointer = SqliteSessionStore
 
 
-def _needs_full_research_suite(prompt_text: str) -> bool:
-    """Return True if the user query explicitly mentions research/vision/code domains outside the fast companion suite."""
-    clean = ConversationContext.clean_user_text(prompt_text)
-    intent = classify_user_intent(clean)
-    if intent in ("url_ingestion", "recipe_scaling"):
-        return True
-    return bool(_RESEARCH_KEYWORDS_RE.search(clean))
-
-
 def _prefetch_local_memory_context(prompt_text: str, config: AgentConfig) -> str:
     """Zero-roundtrip speculative local RAG lookup (<10ms).
 
@@ -257,36 +249,6 @@ def _load_tools_registry(
     if fast_mode and FAST_COMPANION_TOOLS_SCHEMA:
         return registry, FAST_COMPANION_TOOLS_SCHEMA, lambda: get_langchain_tools(fast_mode=True)
     return registry, DEDUPLICATED_TOOLS_SCHEMA or full_schemas, get_langchain_tools
-
-
-def _truncate_output(text: Any, max_chars: int) -> str:
-    """Ensure tool output is a string capped at strictly `max_chars` characters."""
-    from .tools import truncate_output
-
-    return truncate_output(text, max_chars=max_chars)
-
-
-def _salvage_inline_tool_calls(content: str) -> List[Dict[str, Any]]:
-    """Salvage `<tool_call>{...}</tool_call>` blocks from raw text if not parsed by gateway."""
-    if not content or "<tool_call>" not in content:
-        return []
-    salvaged: List[Dict[str, Any]] = []
-    for idx, match in enumerate(_MALFORMED_TOOL_RE.finditer(content)):
-        raw_json = match.group(1).strip()
-        try:
-            obj = json.loads(raw_json)
-            if isinstance(obj, dict) and isinstance(obj.get("name"), str):
-                args = obj.get("arguments", obj.get("args", {}))
-                salvaged.append(
-                    {
-                        "id": f"salvaged_call_{idx}",
-                        "name": obj["name"],
-                        "args": args if isinstance(args, dict) else {},
-                    }
-                )
-        except Exception:  # noqa: BLE001
-            continue
-    return salvaged
 
 
 class AgentRunResult(dict):
@@ -484,6 +446,7 @@ class ColibriAgent:
         on_token: Optional[Callable[[str], None]] = None,
         stream: bool = False,
         checkpointer: Optional[Union[SqliteSessionStore, SessionStore]] = None,
+        tool_suite: Optional[ToolSuite] = None,
     ) -> None:
         self.config = config or AgentConfig()
         self.system_prompt = system_prompt
@@ -492,6 +455,11 @@ class ColibriAgent:
         self.on_token = on_token
         self.stream = stream
         self.checkpointer = checkpointer or SqliteSessionStore()
+        self.tool_suite: ToolSuite = tool_suite or TOOL_SUITE_OBJ
+
+    @property
+    def tool_registry(self) -> ToolSuite:
+        return self.tool_suite
 
     def prefetch_memory(self, prompt_text: str) -> str:
         """Prefetch personal facts from data/memory_db/ for zero-roundtrip local RAG context."""
@@ -505,48 +473,15 @@ class ColibriAgent:
         self,
         tool_calls: Sequence[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
-        """Execute one or more tool calls in parallel delegating directly to `TOOL_REGISTRY_OBJ`."""
+        """Execute one or more tool calls in parallel delegating directly to `ToolSuite`."""
         if not tool_calls:
             return []
-
-        from .tools import TOOL_REGISTRY_OBJ
-
-        def _worker(tc: Dict[str, Any]) -> Tuple[Dict[str, Any], str, float]:
-            t0 = time.monotonic()
-            name = str(tc.get("name") or tc.get("function", {}).get("name") or "")
-            args = tc.get("args")
-            if args is None:
-                args = tc.get("function", {}).get("arguments", "{}")
-            output = TOOL_REGISTRY_OBJ.execute(name, args, max_chars=self.config.max_tool_chars)
-            elapsed = time.monotonic() - t0
-            return tc, output, elapsed
-
-        max_workers = min(len(tool_calls), 6)
-        results: List[Dict[str, Any]] = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = [pool.submit(_worker, tc) for tc in tool_calls]
-            for fut in futures:
-                tc, output, elapsed = fut.result()
-                tc_id = str(tc.get("id") or f"call_{len(results)}")
-                name = str(tc.get("name") or tc.get("function", {}).get("name") or "")
-                args = tc.get("args")
-                if args is None:
-                    args = tc.get("function", {}).get("arguments", "{}")
-                if self.on_tool_call is not None:
-                    try:
-                        self.on_tool_call({"id": tc_id, "name": name, "args": args}, output, elapsed)
-                    except Exception:  # noqa: BLE001
-                        pass
-                results.append(
-                    {
-                        "tool_call_id": tc_id,
-                        "name": name,
-                        "args": args,
-                        "content": output,
-                        "elapsed_s": round(elapsed, 3),
-                    }
-                )
-        return results
+        return self.tool_suite.execute(
+            tool_calls,
+            parallel=True,
+            max_chars=self.config.max_tool_chars,
+            on_tool_call=self.on_tool_call,
+        )
 
     def _chat_completions(
         self,
@@ -560,8 +495,10 @@ class ColibriAgent:
         """Dispatch chat completions request via the configured gateway/transport port."""
         tools = None
         if include_tools:
-            _, schemas, _ = _load_tools_registry(fast_mode=fast_mode)
-            tools = schemas
+            if fast_mode and self.tool_suite.fast_companion_schemas:
+                tools = self.tool_suite.fast_companion_schemas
+            else:
+                tools = self.tool_suite.deduplicated_schemas or self.tool_suite.schemas
 
         slot = self.config.cache_slot if active_slot is None else active_slot
         extra = _colibri_extra_body(self.config, active_slot=active_slot)
@@ -602,7 +539,7 @@ class ColibriAgent:
         tid = (thread_id or "default").strip() or "default"
         clean_prompt = ConversationContext.clean_user_text(prompt)
         resolved_intent = intent or self.classify_intent(clean_prompt)
-        needs_research = _needs_full_research_suite(clean_prompt)
+        needs_research = self.tool_suite.needs_full_research_suite(clean_prompt)
         mem_ctx = memory_context
         if mem_ctx is None and "[LOCAL MEMORY CONTEXT]" not in prompt:
             mem_ctx = self.prefetch_memory(clean_prompt) or None
@@ -702,7 +639,7 @@ class ColibriAgent:
             mem_ctx = self.prefetch_memory(clean_user_text)
 
         # Optimization: Two-Slot Prefix Split (Slot 0 = Fast Companion tools, Slot 1 = Full tools)
-        needs_research = _needs_full_research_suite(clean_user_text)
+        needs_research = self.tool_suite.needs_full_research_suite(clean_user_text)
         use_fast_tools = bool(
             getattr(self.config, "fast_tool_pruning", False)
             and not needs_research
@@ -802,7 +739,7 @@ class ColibriAgent:
 
             # Check for inline <tool_call> tags if gateway returned raw text
             if not normalized_calls and not force_finalize:
-                salvaged = _salvage_inline_tool_calls(content)
+                salvaged = self.tool_suite.salvage_inline_calls(content)
                 if salvaged:
                     normalized_calls = salvaged
 
@@ -923,31 +860,6 @@ class ColibriAgent:
 StdlibColibriAgent = ColibriAgent
 
 
-# Backward-compatible module-level tool execution helpers
-def _execute_single_tool(
-    name: str,
-    args: Union[str, Dict[str, Any]],
-    max_chars: int,
-) -> str:
-    """Execute one named tool safely and truncate its output via `TOOL_REGISTRY_OBJ`."""
-    from .tools import TOOL_REGISTRY_OBJ
-
-    return TOOL_REGISTRY_OBJ.execute(name, args, max_chars=max_chars)
-
-
-def _execute_tool_calls_parallel(
-    tool_calls: Sequence[Dict[str, Any]],
-    max_chars: int,
-    on_tool_call: Optional[Callable[[Dict[str, Any], str, float], None]] = None,
-) -> List[Dict[str, Any]]:
-    """Execute one or more tool calls in parallel delegating to `TOOL_REGISTRY_OBJ`."""
-    agent = ColibriAgent(
-        config=AgentConfig(max_tool_chars=max_chars),
-        on_tool_call=on_tool_call,
-    )
-    return agent.execute_tools(tool_calls)
-
-
 class InternetAgentState(TypedDict, total=False):
     """State schema for the Colibri agent."""
 
@@ -1035,7 +947,7 @@ def build_internet_agent_graph(
             and not force_finalize
             and isinstance(ai_msg.content, str)
         ):
-            salvaged = _salvage_inline_tool_calls(ai_msg.content)
+            salvaged = ToolSuite.salvage_inline_calls(ai_msg.content)
             if salvaged:
                 ai_msg.tool_calls = [
                     {
@@ -1068,8 +980,9 @@ def build_internet_agent_graph(
                 }
             )
 
-        exec_results = _execute_tool_calls_parallel(
+        exec_results = TOOL_SUITE_OBJ.execute(
             normalized,
+            parallel=True,
             max_chars=cfg.max_tool_chars,
             on_tool_call=on_tool_call,
         )
