@@ -803,19 +803,6 @@ class ColibriAgent:
                 intent=intent,
                 step_count=step_count,
             )
-            checkpointer.put(
-                {"configurable": {"thread_id": effective_tid}},
-                {
-                    "v": 1,
-                    "id": f"chk_{effective_tid}",
-                    "channel_values": {
-                        "messages": storage_messages,
-                        "intent": intent,
-                        "step_count": step_count,
-                    },
-                },
-                {"source": "agent", "step": step_count},
-            )
         except Exception:  # noqa: BLE001
             pass
 

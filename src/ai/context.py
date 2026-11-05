@@ -62,18 +62,26 @@ class ConversationContext:
         return text.strip()
 
     @staticmethod
-    def resolve_slot(intent: str = "conversation", requires_research: bool = False) -> int:
+    def resolve_slot(
+        intent: str = "conversation",
+        requires_research: bool = False,
+        config: Optional[Any] = None,
+    ) -> int:
         """Centralize KV-cache slot mapping:
-        - Slot 0: Companion turns (conversation, memory recall)
-        - Slot 1: Research / tools (url_ingestion, recipe_scaling, research)
-        - Slot 2: Classification (SystemOne / routing)
+        - Companion turns: config.cache_slot (default 0)
+        - Research / tools: config.research_cache_slot (default 1)
+        - Classification: config.routing_cache_slot (default 2)
         """
+        slot_companion = getattr(config, "cache_slot", 0) if config else 0
+        slot_research = getattr(config, "research_cache_slot", 1) if config else 1
+        slot_routing = getattr(config, "routing_cache_slot", 2) if config else 2
+
         norm = (intent or "").strip().lower()
         if norm in ("classification", "classifier", "systemone"):
-            return 2
+            return int(slot_routing)
         if requires_research or norm in ("research", "url_ingestion", "recipe_scaling"):
-            return 1
-        return 0
+            return int(slot_research)
+        return int(slot_companion)
 
     @classmethod
     def from_turn(
@@ -85,6 +93,7 @@ class ConversationContext:
         intent: Optional[str] = None,
         requires_research: bool = False,
         slot: Optional[int] = None,
+        config: Optional[Any] = None,
     ) -> ConversationContext:
         """Construct a clean `ConversationContext` for a new turn.
 
@@ -104,7 +113,11 @@ class ConversationContext:
         resolved_slot = (
             slot
             if slot is not None
-            else cls.resolve_slot(resolved_intent, requires_research=requires_research)
+            else cls.resolve_slot(
+                resolved_intent,
+                requires_research=requires_research,
+                config=config,
+            )
         )
 
         msgs: List[Dict[str, Any]] = []

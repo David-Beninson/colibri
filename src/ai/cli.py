@@ -31,6 +31,7 @@ from typing import Any, Dict, List, Optional
 from .config import MLX_BASE_URL, OLLAMA_BASE_URL, AgentConfig, detect_best_local_backend
 from .graph import _load_tools_registry, has_langgraph, run_agent
 from .persona import COMPANION_NAME
+from .session import SqliteSessionStore
 
 
 def _runner_label(force_stdlib: bool = False) -> str:
@@ -186,7 +187,8 @@ def _interactive_loop(config: AgentConfig, force_stdlib: bool = False) -> int:
         "/memory, /voice <path>, /speak <text>, /ocr <path>, /clear, /status, /quit).",
         flush=True,
     )
-    history: List[Dict[str, Any]] = []
+    session_store = SqliteSessionStore()
+    history: List[Dict[str, Any]] = list(session_store.get_history("default"))
 
     while True:
         try:
@@ -224,6 +226,7 @@ def _interactive_loop(config: AgentConfig, force_stdlib: bool = False) -> int:
 
         if line == "/clear":
             history.clear()
+            session_store.clear("default")
             print("[colibri-agent] Conversation history cleared.")
             continue
 
@@ -340,6 +343,8 @@ def _interactive_loop(config: AgentConfig, force_stdlib: bool = False) -> int:
                 history=history,
                 on_tool_call=_trace_cb,
                 force_stdlib=force_stdlib,
+                thread_id="default",
+                checkpointer=session_store,
             )
             history.append({"role": "user", "content": line})
             history.append({"role": "assistant", "content": result.answer})

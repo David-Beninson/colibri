@@ -355,20 +355,14 @@ class ToolSuite:
             return True
         return bool(_RESEARCH_KEYWORDS_RE.search(clean))
 
+    @classmethod
     def prune_for_prompt(
-        self_or_cls,
+        cls,
         prompt_text: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Keyword-based tool pruning heuristic returning schemas tailored to user prompt."""
-        if isinstance(self_or_cls, type):
-            suite = TOOL_SUITE_OBJ
-            text = prompt_text if prompt_text is not None else ""
-        elif isinstance(self_or_cls, str) and prompt_text is None:
-            suite = TOOL_SUITE_OBJ
-            text = self_or_cls
-        else:
-            suite = self_or_cls
-            text = prompt_text or ""
+        suite = cls if isinstance(cls, ToolSuite) else TOOL_SUITE_OBJ
+        text = prompt_text or ""
         if suite.needs_full_research_suite(text):
             return suite.deduplicated_schemas
         return suite.fast_companion_schemas

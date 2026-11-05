@@ -307,15 +307,18 @@ class HttpGatewayAdapter(ColibriGatewayPort):
             if normalize is True
             else ("none" if normalize is False else str(normalize))
         )
+        merged_extra: Dict[str, Any] = {"cache_slot": slot}
+        if extra_body:
+            merged_extra.update(extra_body)
+
         body: Dict[str, Any] = {
             "model": model or self.model,
             "state": state,
             "questions": dict(questions or {}),
             "normalize": norm_val,
             "cache_slot": slot,
+            "extra_body": merged_extra,
         }
-        if extra_body:
-            body.update(extra_body)
 
         headers = {
             "Content-Type": "application/json",

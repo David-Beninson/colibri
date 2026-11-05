@@ -1485,6 +1485,52 @@ class ColibriAgentTestSuite(unittest.TestCase):
         self.assertEqual(len(delegated_results), 1)
         self.assertEqual(json.loads(delegated_results[0]["content"])["result"], 10)
 
+    def test_gateway_extra_body_kv_slot_and_cli_session_store(self) -> None:
+        """Verify HttpGatewayAdapter extra_body KV slot compliance and CLI SessionStore wiring."""
+        # 1. Verify decide_systemone payload extra_body KV slot
+        adapter = HttpGatewayAdapter(base_url="http://mock-colibri.internal/v1")
+        captured_reqs: List[urllib.request.Request] = []
+
+        def fake_urlopen(req: urllib.request.Request, timeout: float = 30.0) -> Any:
+            captured_reqs.append(req)
+            resp_data = json.dumps({"questions": {"q": {"choice": "web_research", "confidence": 0.9}}}).encode("utf-8")
+            from io import BytesIO
+            bio = BytesIO(resp_data)
+            setattr(bio, "read", bio.read)
+            return bio
+
+        with patch.object(urllib.request, "urlopen", side_effect=fake_urlopen):
+            res = adapter.decide_systemone(
+                state="query",
+                questions={"q": {"type": "choice"}},
+                slot=2,
+            )
+            self.assertEqual(res["questions"]["q"]["choice"], "web_research")
+            self.assertEqual(len(captured_reqs), 1)
+            sent_body = json.loads(captured_reqs[0].data.decode("utf-8"))
+            # Standard AGENTS_MAIN.md §3.1 check
+            self.assertEqual(sent_body["cache_slot"], 2)
+            self.assertIn("extra_body", sent_body)
+            self.assertEqual(sent_body["extra_body"]["cache_slot"], 2)
+
+        # 2. Verify ConversationContext slot configuration overrides
+        cfg = AgentConfig(cache_slot=4, research_cache_slot=5, routing_cache_slot=6)
+        ctx_companion = ConversationContext.from_turn("hello", config=cfg)
+        self.assertEqual(ctx_companion.slot, 4)
+        ctx_research = ConversationContext.from_turn("research arxiv", requires_research=True, config=cfg)
+        self.assertEqual(ctx_research.slot, 5)
+        ctx_routing = ConversationContext.from_turn("classify query", intent="classification", config=cfg)
+        self.assertEqual(ctx_routing.slot, 6)
+
+        # 3. Verify CLI SessionStore clear and history persistence
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "cli_test.sqlite")
+            store = SqliteSessionStore(db_path=db_path)
+            store.save_checkpoint("default", [{"role": "user", "content": "hello"}])
+            self.assertEqual(len(store.get_history("default")), 1)
+            store.clear("default")
+            self.assertEqual(len(store.get_history("default")), 0)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
