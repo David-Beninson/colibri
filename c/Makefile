@@ -1,28 +1,22 @@
-# Colibri Build System — Apple Silicon M1 (macOS + Metal + Qwen3.6)
+# Colibri Build System — Portable CPU default (optional macOS + Metal)
 
+ifeq ($(shell uname -s 2>/dev/null),Darwin)
 ifneq ($(wildcard /Library/Developer/CommandLineTools),)
 export DEVELOPER_DIR ?= /Library/Developer/CommandLineTools
-export PATH := /Library/Developer/CommandLineTools/usr/bin:$(PATH)
+endif
 endif
 
-SYSROOT ?= $(shell xcrun --show-sdk-path 2>/dev/null)
-ifeq ($(SYSROOT),)
-SYSROOT := $(wildcard /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk)
-endif
-SYSROOT_FLAG := $(if $(SYSROOT),-isysroot $(SYSROOT),)
+CC            ?= cc
+CXX           ?= c++
+PYTHON        ?= python3
+METAL         ?= 0
+EXTRA_CFLAGS  ?=
+EXTRA_LDFLAGS ?=
 
-CC            = clang
-CXX           = clang++
-PYTHON       ?= python3
-METAL        ?= 1
-ARCH         ?= apple-m1
-EXTRA_CFLAGS ?=
-EXTRA_LDFLAGS?=
-
-PREFIX       ?= /usr/local
-BINDIR       ?= $(PREFIX)/bin
-LIBEXECDIR   ?= $(PREFIX)/libexec/colibri
-INSTALL      ?= install
+PREFIX        ?= /usr/local
+BINDIR        ?= $(PREFIX)/bin
+LIBEXECDIR    ?= $(PREFIX)/libexec/colibri
+INSTALL       ?= install
 
 # --- OpenMP detection (Homebrew / MacPorts) ---
 OMP_EXPLICIT := $(filter command line environment,$(origin OMPDIR))
@@ -52,26 +46,40 @@ OMPL =
 endif
 
 # --- Compiler & Linker Flags ---
-WARN_FLAGS       = -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -Wno-deprecated-declarations -MMD -MP
-METAL_FRAMEWORKS = -framework Metal -framework MetalPerformanceShaders -framework Accelerate -framework Foundation
+WARN_FLAGS = -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function -Wno-deprecated-declarations -MMD -MP
 
-CFLAGS  = -O3 -mcpu=$(ARCH) $(SYSROOT_FLAG) $(OMPC) -DACCELERATE_NEW_LAPACK $(WARN_FLAGS) $(EXTRA_CFLAGS)
-LDFLAGS = -lm $(OMPL) $(SYSROOT_FLAG) -framework Accelerate $(EXTRA_LDFLAGS)
+CFLAGS     = -O3 $(WARN_FLAGS) $(EXTRA_CFLAGS)
+LDFLAGS    = -lm $(EXTRA_LDFLAGS)
 
-METAL_CXX      = $(CXX) $(SYSROOT_FLAG) -x objective-c++ -std=gnu++17 -fobjc-arc -O3 -mcpu=$(ARCH) -DACCELERATE_NEW_LAPACK
-METALXX        = $(METAL_CXX) $(METAL_FRAMEWORKS)
+ifneq ($(ARCH),)
+CFLAGS    += -mcpu=$(ARCH)
+endif
+
+ifneq ($(OMPINC),)
+CFLAGS    += $(OMPC)
+LDFLAGS   += $(OMPL)
+endif
 
 ifeq ($(METAL),1)
-CFLAGS        += -DCOLI_METAL -DQWEN36_QPACK
-LDFLAGS       += $(METAL_FRAMEWORKS) -lc++
-QWEN36_OBJS    = backend_metal.o qwen36_qpack.o qpack.o
+SYSROOT ?= $(shell xcrun --show-sdk-path 2>/dev/null)
+ifeq ($(SYSROOT),)
+SYSROOT := $(wildcard /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk)
+endif
+SYSROOT_FLAG := $(if $(SYSROOT),-isysroot $(SYSROOT),)
+
+METAL_FRAMEWORKS = -framework Metal -framework MetalPerformanceShaders -framework Accelerate -framework Foundation
+CFLAGS          += -DCOLI_METAL -DQWEN36_QPACK -DCOLI_ACCELERATE -DACCELERATE_NEW_LAPACK $(SYSROOT_FLAG)
+LDFLAGS         += $(METAL_FRAMEWORKS) $(SYSROOT_FLAG) -lc++
+METAL_CXX        = $(CXX) $(SYSROOT_FLAG) -x objective-c++ -std=gnu++17 -fobjc-arc -O3 -DACCELERATE_NEW_LAPACK $(if $(ARCH),-mcpu=$(ARCH),)
+METALXX          = $(METAL_CXX) $(METAL_FRAMEWORKS)
+QWEN36_OBJS      = backend_metal.o qwen36_qpack.o qpack.o
 else
-QWEN36_OBJS    =
+QWEN36_OBJS      =
 endif
 
 ifeq ($(LTO),1)
-CFLAGS        += -flto
-LDFLAGS       += -flto
+CFLAGS  += -flto
+LDFLAGS += -flto
 endif
 
 # --- Core Targets ---

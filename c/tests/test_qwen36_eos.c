@@ -6,11 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#ifdef _WIN32
-#include <direct.h>
-#else
 #include <sys/stat.h>
-#endif
 
 #define main qwen36_main_unused
 #include "../qwen36.c"
@@ -25,11 +21,7 @@ int main(void) {
     int fails = 0;
     /* a checkpoint directory: the list in config.json, one more in generation_config.json */
     const char *dir = "tests/tmp_q36_eos";
-#ifdef _WIN32
-    _mkdir(dir);
-#else
     mkdir(dir, 0700);
-#endif
     char path[512];
     snprintf(path, sizeof path, "%s/config.json", dir);
     FILE *f = fopen(path, "wb");
@@ -51,11 +43,7 @@ int main(void) {
     }
     snprintf(path, sizeof path, "%s/config.json", dir); remove(path);
     snprintf(path, sizeof path, "%s/generation_config.json", dir); remove(path);
-#ifdef _WIN32
-    _rmdir(dir);
-#else
     rmdir(dir);
-#endif
 
     /* a GGUF: eog_token_ids (u32) and eos_token_id, the latter already in the list */
     g_n_model_eos = 0;

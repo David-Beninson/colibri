@@ -10,23 +10,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#ifndef _WIN32
 #include <unistd.h>
 #include <sys/wait.h>
-#endif
 
-#ifndef _WIN32
 /* Forward-declare the shadow under its own name before the macro below hijacks every
  * "realloc" token that follows, mirroring tests/test_798_guards.c's technique. */
 static void *test_realloc_seam(void *p, size_t n);
 #define realloc test_realloc_seam
-#endif
 
 #define main qwen36_main_unused
 #include "../qwen36.c"
 #undef main
 
-#ifndef _WIN32
 #undef realloc
 
 static long g_realloc_n = 0, g_realloc_fail_at = -1;
@@ -37,14 +32,12 @@ static void *test_realloc_seam(void *p, size_t n){
     return realloc(p, n);
 }
 static void reset_seam(void){ g_realloc_n = 0; g_realloc_fail_at = -1; }
-#endif
 
 static int g_nfails = 0;
 static void check(int cond, const char *what){
     if (!cond) { printf("FAIL: %s\n", what); g_nfails++; }
 }
 
-#ifndef _WIN32
 /* fork/pipe/waitpid harness, mirrors tests/test_798_guards.c's inline idiom */
 static void run_forked(void (*fn)(void), int *exit_code, char *errbuf, size_t errbuf_sz) {
     int pipefd[2];
@@ -108,7 +101,6 @@ static void test_bpe_piece_oom(void) {
           "bpe_piece: message names the buffer");
     reset_seam();
 }
-#endif
 
 /* ---- controls: same growth paths, no injection -- must succeed normally ---- */
 static void test_push_id_control(void) {
@@ -132,12 +124,8 @@ static void test_bpe_piece_control(void) {
 }
 
 int main(void) {
-#ifndef _WIN32
     test_push_id_oom();
     test_bpe_piece_oom();
-#else
-    printf("qwen36 encode allocation-failure injection: skipped on Windows (no fork)\n");
-#endif
     test_push_id_control();
     test_bpe_piece_control();
 

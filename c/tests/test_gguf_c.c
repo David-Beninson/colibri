@@ -2,18 +2,11 @@
  *   test_gguf_c FILE            -> "OK", kv lines, tensor lines (with a float checksum)
  *   test_gguf_c FILE TENSOR     -> the tensor as float32 on stdout
  *   test_gguf_c --join DIR PATH -> the path an engine opens for gguf.json's PATH in DIR */
-#ifdef _WIN32
-#include <fcntl.h>
-#include <io.h>
-#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include "../gguf.h"
 
 int main(int argc, char **argv) {
-#ifdef _WIN32   /* the blocks and floats go through stdin/stdout: no CRLF translation */
-    _setmode(_fileno(stdin), _O_BINARY); _setmode(_fileno(stdout), _O_BINARY);
-#endif
     if (argc < 2) return 2;
     if (argc == 4 && !strcmp(argv[1], "--join")) {
         char out[4096]; gguf_path_join(out, sizeof out, argv[2], argv[3]);

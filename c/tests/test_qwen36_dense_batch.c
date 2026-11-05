@@ -49,18 +49,10 @@ static void one_shape(int S, int I, int O) {
 }
 
 static void env_set(const char *name,const char *value) {
-#ifdef _WIN32
-    _putenv_s(name,value);
-#else
     setenv(name,value,1);
-#endif
 }
 static void env_unset(const char *name) {
-#ifdef _WIN32
-    _putenv_s(name,"");
-#else
     unsetenv(name);
-#endif
 }
 
 static void clear_qw(Layer *l) { qw_free(&l->sh_g); qw_free(&l->sh_u); qw_free(&l->sh_d); }

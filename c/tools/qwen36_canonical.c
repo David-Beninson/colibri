@@ -76,11 +76,7 @@ static int qwen36_canonical_write(const char *path, shards *S, const QdfSpec *sp
     int ok = qdf_write_header(out, e, n, fingerprint, bytes);
     for (int i = 0; ok && i < n; i++) ok = convert(out, &at, S, &spec[i], &e[i], block);
     ok = ok && qdf_pad(out, &at, bytes) && !fflush(out);
-#ifdef _WIN32
-    ok = ok && !_commit(_fileno(out));
-#else
     ok = ok && !fsync(fileno(out));
-#endif
     ok = !fclose(out) && ok && !rename(tmp, path);
     if (!ok) { fprintf(stderr, "writing %s failed: %s\n", path, strerror(errno)); remove(tmp); }
     free(e);

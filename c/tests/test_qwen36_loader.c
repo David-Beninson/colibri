@@ -121,10 +121,6 @@ int main(void) {
     CHECK(fixture(path, 128, 192) == 0);
     CHECK(exercise(dir, 128, 192, 0) == 0); CHECK(exercise(dir, 128, 192, 1) == 0);
     CHECK(remove(path) == 0);
-#ifdef _WIN32
-    CHECK(_rmdir(dir) == 0);
-#else
     CHECK(rmdir(dir) == 0);
-#endif
     puts("merged int4 loader tests: ok"); return 0;
 }

@@ -5688,7 +5688,7 @@ static float *g_hidden_sink = NULL;
 
 static void q36_seq_swap(Model *m, Q36Seq *q);   /* below: a chain swaps a conversation in to rebuild it */
 static void q36_embed_row(Model *m, int id, int pos, float *row);
-static int q36_cuda_tier_drafts(Model *m);   /* the CUDA tier whole, run by the CUDA chain */
+
 static inline int qt_ready(void) { return 0; }
 #include "qwen36_mtp.h"    /* Q36_MTP: the MTP head drafts for the speculative step */
 static void q36_mtp_lm_head(Model *m, const float *row, float *logits) {
@@ -5741,10 +5741,6 @@ static void q36_embed_row(Model *m, int id, int pos, float *row) {
     if (m->c.muse && !(vrow >= 0 && vrow < m->vis_rows_n)) rmsnorm_plain(row, row, D, m->c.eps);   /* Muse Spark: the token's row normalised */
 }
 
-static int q36_cuda_tier_drafts(Model *m) {
-    (void)m;
-    return 0;
-}
 
 /* The forward: ids[0..S) at pos_base through every layer, the final norm and
  * lm_head on the last `nlogits` rows (one for a step, every row of a speculative
@@ -6530,7 +6526,7 @@ static void q36_spec_begin(Model *m, Q36Spec *sp, const int *prompt, int np) {
     sp->force = q36_spec_force_mode(getenv("COLI_LOOKUP_FORCE"), &sp->force_row);
     e = getenv("COLI_SPEC_GATE");
     spec_gate_init(&sp->gate, e && *e == '0');
-    int tier_off = (qt_ready() || m->dn_dev) && !q36_cuda_tier_drafts(m);
+    int tier_off = (qt_ready() || m->dn_dev);
     if (sp->lookup && (tier_off || g_cache_route || qq_active())) {
         static int said;
         if (!said && asked) {   /* the default stays quiet: nothing was asked for */

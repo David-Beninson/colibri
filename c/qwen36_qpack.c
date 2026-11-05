@@ -42,9 +42,6 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
-#ifdef _WIN32
-#include <malloc.h>
-#endif
 
 #include "qpack.h"
 #ifdef COLI_METAL
@@ -93,21 +90,13 @@ static int qq_fail(char *error, size_t capacity, const char *message) {
  * backend_metal.h: 16384-aligned base, length a multiple of 16384 (the
  * qpack layout already guarantees the stride). */
 static unsigned char *qq_blob_alloc(size_t stride) {
-#ifdef _WIN32
-    return (unsigned char *)_aligned_malloc(stride, 16384);
-#else
     void *p = NULL;
     if (posix_memalign(&p, 16384, stride) != 0) return NULL;
     return (unsigned char *)p;
-#endif
 }
 
 static void qq_blob_free(unsigned char *p) {
-#ifdef _WIN32
-    _aligned_free(p);
-#else
     free(p);
-#endif
 }
 
 /* Build and geometry-check the three projection views for one slot fill.

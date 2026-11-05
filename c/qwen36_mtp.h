@@ -143,7 +143,7 @@ static int q36_mtp_load(Model *m) {
          * Unset, a list of DRAFT_VOCAB_DEFAULT_TOP where the head drafts on the CUDA chain (measured
          * there), the whole vocabulary elsewhere; 0 is always the whole vocabulary. */
         const char *ve = getenv("Q36_MTP_VOCAB"), *dmp = getenv("Q36_MTP_DUMP");
-        int top = q36_cuda_tier_drafts(m) ? DRAFT_VOCAB_DEFAULT_TOP : 0;
+        int top = 0;
         if (ve && *ve) {
             char *end = NULL; long parsed = strtol(ve, &end, 10);
             if (end == ve || *end || parsed < 0 || parsed > (long)c->vocab) {
@@ -151,7 +151,7 @@ static int q36_mtp_load(Model *m) {
             }
             top = (int)parsed;
         }
-        int can = !(dmp && *dmp) && 0 < top && top < c->vocab && (m->lm_head.q || m->lm_head.w || q36_cuda_tier_drafts(m));
+        int can = !(dmp && *dmp) && 0 < top && top < c->vocab && (m->lm_head.q || m->lm_head.w);
         if (can) {
             const char *snap = getenv("SNAP"), *vp = getenv("COLI_VOCAB_USAGE"), *up = getenv("COLI_USAGE");
             if (!snap || !*snap) snap = ".";
@@ -515,7 +515,7 @@ static void q36_mtp_attach(Model *m) {
      * a head there would only be fed, every row brought back from the chain for nothing.
      * Under the CUDA chain with the whole tier there are, and the head runs on its device
      * (qwen36_mtp_cuda.h). */
-    if ((qt_ready() || m->dn_dev) && !q36_cuda_tier_drafts(m)) {
+    if (qt_ready() || m->dn_dev) {
         fprintf(stderr, "[mtp] Q36_MTP=1: the head stays off under a CUDA tier holding part of the experts, "
                         "where there are no speculative steps\n");
         return;

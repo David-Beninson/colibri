@@ -34,9 +34,7 @@
 #undef main
 
 #include <sys/stat.h>
-#ifndef _WIN32
 #include <sys/wait.h>
-#endif
 
 #define CHECK(condition) do {                                                   \
     if (!(condition)) {                                                         \
@@ -114,11 +112,7 @@ static const float plain_bf16_vals[4] = { 1.0f, -2.0f, 0.5f, 4.0f };
 static const float plain_f32_vals[3] = { 0.25f, -0.5f, 8.0f };
 
 static void build_fixture_dir(const char *dir) {
-#ifdef _WIN32
-    _mkdir(dir);
-#else
     mkdir(dir, 0700);
-#endif
     static uint16_t q4_scales[4], q4_biases[4], q8_scales[3], q8_biases[3];
     static uint16_t plain_bf16[4];
     for (int r = 0; r < 2; r++) for (int g = 0; g < 2; g++) {
@@ -231,7 +225,6 @@ static void test_prefix_resolution(void) {
     free(u);
 }
 
-#ifndef _WIN32
 static void expect_load_death(const char *name, int64_t want) {
     pid_t pid = fork();
     CHECK(pid >= 0);
@@ -253,7 +246,6 @@ static void test_refusals(void) {
     expect_load_death("model.plain.weight", 5);           /* plain wrong size */
     expect_load_death("model.absent.weight", 4);          /* missing tensor */
 }
-#endif
 
 /* ---- Python round-trip harness ------------------------------------------ */
 
@@ -301,9 +293,7 @@ int main(int argc, char **argv) {
     test_prefix_resolution();
     test_norm_unshift();
     test_meta_flag();
-#ifndef _WIN32
     test_refusals();
-#endif
     printf("test_qwen36_dense_affine: OK\n");
     return 0;
 }

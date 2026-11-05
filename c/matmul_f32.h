@@ -7,7 +7,7 @@
 
 #include <math.h>
 #include <stdint.h>
-#ifdef __APPLE__
+#if defined(COLI_ACCELERATE) && defined(__APPLE__)
 #ifndef ACCELERATE_NEW_LAPACK
 #define ACCELERATE_NEW_LAPACK
 #endif
@@ -47,7 +47,7 @@ static inline float dot_f32_lanes(const float *x, const float *w, int I){
 }
 
 static void matmul(float *y, const float *x, const float *W, int S, int I, int O){
-#ifdef __APPLE__
+#if defined(COLI_ACCELERATE) && defined(__APPLE__)
     if (S > 1) {
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, S, O, I, 1.0f, x, I, W, I, 0.0f, y, O);
         return;

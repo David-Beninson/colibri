@@ -65,11 +65,7 @@ static void fx_path(char *out, size_t cap, const char *root, const char *name) {
 }
 
 static void fx_mkdir(const char *path) {
-#ifdef _WIN32
-    CHECK(_mkdir(path) == 0);
-#else
     CHECK(mkdir(path, 0700) == 0);
-#endif
 }
 
 static void fx_write(const char *path, const void *data, size_t size) {
@@ -163,11 +159,7 @@ static void fx_cleanup(const char *root) {
     fx_path(path, sizeof(path), root, "manifest.json");
     remove(path);
     fx_path(path, sizeof(path), root, "packed_experts");
-#ifdef _WIN32
-    _rmdir(path); _rmdir(root);
-#else
     rmdir(path); rmdir(root);
-#endif
 }
 
 /* Independent oracle: read the blob with the raw qpack reader and compose the

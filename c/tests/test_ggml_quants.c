@@ -1,18 +1,11 @@
 /* Drives ggml_quants.h for tests/test_ggml_quants.py: reads
  *   int32 type, int64 n_elements, then the raw row bytes
  * from stdin and writes n_elements float32 to stdout (gq_dequant_row). */
-#ifdef _WIN32
-#include <fcntl.h>
-#include <io.h>
-#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include "../ggml_quants.h"
 
 int main(void) {
-#ifdef _WIN32   /* the blocks and floats go through stdin/stdout: no CRLF translation */
-    _setmode(_fileno(stdin), _O_BINARY); _setmode(_fileno(stdout), _O_BINARY);
-#endif
     int32_t t; int64_t n;
     if (fread(&t, 4, 1, stdin) != 1 || fread(&n, 8, 1, stdin) != 1) return 2;
     int64_t rb = gq_row_bytes(t, n);

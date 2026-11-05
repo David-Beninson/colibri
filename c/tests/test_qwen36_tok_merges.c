@@ -58,11 +58,7 @@ static void check_encoding(const char *tok_path, const char *label) {
 
 int main(void) {
     const char *dir = "tests/tmp_tok_merges";
-#ifdef _WIN32
-    _mkdir(dir);
-#else
     mkdir(dir, 0700);
-#endif
     char pairs_path[256], strings_path[256];
     snprintf(pairs_path, sizeof(pairs_path), "%s/tokenizer_pairs.json", dir);
     snprintf(strings_path, sizeof(strings_path), "%s/tokenizer_strings.json", dir);

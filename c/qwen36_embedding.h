@@ -22,15 +22,6 @@ typedef struct {
 /* A private read-only mapping of the file, never an anonymous copy; on Windows
  * st.h's read-only file view, its length rounded up to whole pages. */
 static inline int qem_map_view(int fd,int64_t off,size_t len,compat_ro_map *map,const void **data) {
-#ifdef _WIN32
-    int status=compat_map_readonly(fd,off,len,map,data);
-    if(!status) {
-        SYSTEM_INFO si;GetSystemInfo(&si);size_t page=si.dwPageSize?si.dwPageSize:4096;
-        if(map->len>SIZE_MAX-(page-1)){compat_unmap_readonly(map);*data=NULL;errno=EOVERFLOW;return -1;}
-        map->len=((map->len+page-1)/page)*page;
-    }
-    return status;
-#else
     if(!map || !data || fd<0 || off<0 || !len){errno=EINVAL;return -1;}
     memset(map,0,sizeof(*map));*data=NULL;
     long page=sysconf(_SC_PAGESIZE);if(page<=0){errno=EINVAL;return -1;}
@@ -43,7 +34,6 @@ static inline int qem_map_view(int fd,int64_t off,size_t len,compat_ro_map *map,
     void *base=mmap(NULL,extent,PROT_READ,MAP_PRIVATE,fd,(off_t)aligned);
     if(base==MAP_FAILED)return -1;
     map->base=base;map->len=extent;*data=(const unsigned char *)base+delta;return 0;
-#endif
 }
 #ifndef QEM_MAP_VIEW
 #define QEM_MAP_VIEW qem_map_view
@@ -54,9 +44,6 @@ static inline int qem_map_view(int fd,int64_t off,size_t len,compat_ro_map *map,
 
 static inline int qem_empty(const QwenEmbedding *e) {
     if(!e || e->map.base || e->map.len || e->data || e->nbytes || e->row_bytes || e->I || e->O || e->dtype)return 0;
-#ifdef _WIN32
-    if(e->map.mapping)return 0;
-#endif
     return 1;
 }
 static inline void qem_free(QwenEmbedding *e) {

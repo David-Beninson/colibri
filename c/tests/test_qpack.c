@@ -155,19 +155,11 @@ static void make_path(char *output, size_t capacity,
 }
 
 static void make_dir(const char *path) {
-#ifdef _WIN32
-    CHECK(_mkdir(path) == 0);
-#else
     CHECK(mkdir(path, 0700) == 0);
-#endif
 }
 
 static void remove_dir(const char *path) {
-#ifdef _WIN32
-    CHECK(_rmdir(path) == 0);
-#else
     CHECK(rmdir(path) == 0);
-#endif
 }
 
 static void must_write(const char *path, const void *data, size_t size) {
