@@ -874,6 +874,24 @@ class ColibriAgentTestSuite(unittest.TestCase):
             self.assertEqual(len(all_ckpts), 1)
             self.assertEqual(all_ckpts[0].config["configurable"]["thread_id"], "session_alpha")
 
+            # Verify LangGraph adapter module decoupling and delegation
+            from src.ai.langgraph_adapter import (
+                InternetAgentState as AdapterState,
+                build_internet_agent_graph as adapter_build_graph,
+                has_langgraph as adapter_has_lg,
+            )
+            from src.ai import (
+                InternetAgentState as RootState,
+                build_internet_agent_graph as root_build_graph,
+            )
+            self.assertIs(AdapterState, RootState)
+            self.assertIs(adapter_build_graph, root_build_graph)
+            self.assertIsInstance(adapter_has_lg(), bool)
+
+            # Test force_stdlib delegation cleanly returns ColibriAgent
+            stdlib_runner = adapter_build_graph(force_stdlib=True)
+            self.assertIsInstance(stdlib_runner, ColibriAgent)
+
     def test_intent_classification_and_sqlite_checkpoint_persistence(self) -> None:
         self.assertEqual(
             classify_user_intent("Please ingest https://example.org/pancake-recipe into my vault"),
