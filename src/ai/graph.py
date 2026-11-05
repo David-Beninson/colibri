@@ -1,12 +1,15 @@
 """LangGraph & zero-dependency StateGraph orchestration engine for Colibri (`src/ai/graph.py`).
 
 Targets Qwen3.6-35B-A3B (`qwen36-35b`) served via `coli serve` with:
+- Unified deep `ColibriAgent` runner with StateGraph compatibility (`.invoke()`, `.run()`)
+- Pluggable `ColibriTransport` network port seam with default `HttpTransport` (SSE streaming + JSON)
 - Stateful KV + DeltaNet prefix caching (`cache_slot`, static system prompt & tool definitions)
 - Thinking-block preservation across tool turns (`preserve_thinking: True`)
 - Automatic server-side context compaction (`context_compaction: "auto"`)
-- Parallel SSRF-safe internet tool execution (`ThreadPoolExecutor`) with output truncation
-- Step-budget & malformed-tool reflection guard (`reflect_and_guard` node)
-- Automatic fallback to `StdlibColibriAgent` (`urllib.request`) when `langgraph` is not installed
+- Parallel SSRF-safe tool execution delegating to `TOOL_REGISTRY_OBJ` with output truncation
+- Step-budget & malformed-tool reflection guard
+- Zero-roundtrip speculative local RAG memory prefetching
+- Native persistent SQLite session checkpointing (`ColibriSqliteCheckpointer`)
 """
 from __future__ import annotations
 
@@ -114,7 +117,7 @@ def _colibri_extra_body(config: AgentConfig, active_slot: Optional[int] = None) 
     """Build Colibri `/v1/chat/completions` extension fields for Qwen3.6 prefix reuse."""
     if getattr(config, "is_ollama_or_metal", False):
         return {}
-    body = config.extra_body()
+    body = config.extra_body(slot=active_slot)
     # Explicitly ensure preserve_thinking is True when not overridden so Qwen3.6
     # reuses the KV & DeltaNet prefix across multi-step tool turns.
     if config.preserve_thinking is None:
@@ -198,7 +201,7 @@ class ColibriSqliteCheckpointer(BaseCheckpointSaver):
     """Persistent zero-dependency SQLite checkpointer (`data/memory_db/checkpoints.sqlite`).
 
     Saves and restores multi-turn session history (`thread_id`, `messages`, `intent`,
-    `step_count`, `updated_at`) across process restarts natively for both `StdlibColibriAgent`
+    `step_count`, `updated_at`) across process restarts natively for both `ColibriAgent`
     and LangGraph `StateGraph`.
     """
 
@@ -501,96 +504,6 @@ def _truncate_output(text: Any, max_chars: int) -> str:
     return raw
 
 
-def _execute_single_tool(
-    name: str,
-    args: Union[str, Dict[str, Any]],
-    max_chars: int,
-) -> str:
-    """Execute one named tool safely and truncate its output."""
-    registry, _, _ = _load_tools_registry()
-    if isinstance(args, str):
-        try:
-            parsed_args = json.loads(args) if args.strip() else {}
-        except json.JSONDecodeError as exc:
-            return f"Error: malformed JSON arguments for tool '{name}': {exc}"
-    elif isinstance(args, dict):
-        parsed_args = dict(args)
-    else:
-        parsed_args = {}
-
-    if not isinstance(parsed_args, dict):
-        return f"Error: tool '{name}' arguments must decode to a JSON object."
-
-    # Pass max_chars down if the tool accepts it and caller didn't specify one
-    fn = registry.get(name)
-    if fn is None:
-        return f"Error: unknown tool '{name}'. Available tools: {', '.join(sorted(registry))}"
-
-    try:
-        result = fn(**parsed_args)
-    except TypeError:
-        try:
-            # Fallback if single positional arg was passed under 'input' or 'query'
-            result = fn(**parsed_args)
-        except Exception as exc:  # noqa: BLE001
-            return f"Error executing tool '{name}': {exc}"
-    except Exception as exc:  # noqa: BLE001
-        return f"Error executing tool '{name}': {exc}"
-
-    return _truncate_output(result, max_chars)
-
-
-def _execute_tool_calls_parallel(
-    tool_calls: Sequence[Dict[str, Any]],
-    max_chars: int,
-    on_tool_call: Optional[Callable[[Dict[str, Any], str, float], None]] = None,
-) -> List[Dict[str, Any]]:
-    """Execute one or more tool calls in parallel via `ThreadPoolExecutor`.
-
-    Each item in `tool_calls` must provide `id`, `name`, and `args` (dict or JSON str).
-    Returns a list of tool result dicts in the same order as `tool_calls`.
-    """
-    if not tool_calls:
-        return []
-
-    def _worker(tc: Dict[str, Any]) -> Tuple[Dict[str, Any], str, float]:
-        t0 = time.monotonic()
-        name = str(tc.get("name") or tc.get("function", {}).get("name") or "")
-        args = tc.get("args")
-        if args is None:
-            args = tc.get("function", {}).get("arguments", "{}")
-        output = _execute_single_tool(name, args, max_chars=max_chars)
-        elapsed = time.monotonic() - t0
-        return tc, output, elapsed
-
-    max_workers = min(len(tool_calls), 6)
-    results: List[Dict[str, Any]] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = [pool.submit(_worker, tc) for tc in tool_calls]
-        for fut in futures:
-            tc, output, elapsed = fut.result()
-            tc_id = str(tc.get("id") or f"call_{len(results)}")
-            name = str(tc.get("name") or tc.get("function", {}).get("name") or "")
-            args = tc.get("args")
-            if args is None:
-                args = tc.get("function", {}).get("arguments", "{}")
-            if on_tool_call is not None:
-                try:
-                    on_tool_call({"id": tc_id, "name": name, "args": args}, output, elapsed)
-                except Exception:  # noqa: BLE001
-                    pass
-            results.append(
-                {
-                    "tool_call_id": tc_id,
-                    "name": name,
-                    "args": args,
-                    "content": output,
-                    "elapsed_s": round(elapsed, 3),
-                }
-            )
-    return results
-
-
 def _salvage_inline_tool_calls(content: str) -> List[Dict[str, Any]]:
     """Salvage `<tool_call>{...}</tool_call>` blocks from raw text if not parsed by gateway."""
     if not content or "<tool_call>" not in content:
@@ -669,66 +582,84 @@ class AgentRunResult(dict):
         return str(self.get("answer", ""))
 
 
-class StdlibColibriAgent:
-    """Zero-dependency StateGraph runner (`agent -> tools -> reflect_and_guard -> end`).
+# ==============================================================================
+# Network Transport Seam (Transport Port & Adapters)
+# ==============================================================================
 
-    Communicates directly with Colibri's `/v1/chat/completions` via `urllib.request`
-    using the exact same node transitions and Qwen3.6 KV-cache extensions as the
-    LangGraph workflow.
+class ColibriTransport:
+    """Abstract network transport port for Colibri / OpenAI-compatible chat completions.
+
+    Allows injecting alternative transport implementations (e.g. `urllib`, `httpx`, or in-memory mocks)
+    without modifying agent workflow logic.
     """
 
-    runner_name = "stdlib"
-
-    def __init__(
+    def complete(
         self,
-        config: Optional[AgentConfig] = None,
-        system_prompt: str = SYSTEM_PROMPT,
-        on_tool_call: Optional[Callable[[Dict[str, Any], str, float], None]] = None,
-        on_token: Optional[Callable[[str], None]] = None,
-        stream: bool = False,
-        checkpointer: Optional[ColibriSqliteCheckpointer] = None,
-    ) -> None:
-        self.config = config or AgentConfig()
-        self.system_prompt = system_prompt
-        self.on_tool_call = on_tool_call
-        self.on_token = on_token
-        self.stream = stream
-        self.checkpointer = checkpointer or ColibriSqliteCheckpointer()
-
-    def _chat_completions(
-        self,
-        messages: List[Dict[str, Any]],
-        include_tools: bool = True,
-        fast_mode: bool = False,
+        config: AgentConfig,
+        messages: Sequence[Dict[str, Any]],
+        tools: Optional[Sequence[Dict[str, Any]]] = None,
         active_slot: Optional[int] = None,
         stream_tokens: bool = False,
         token_callback: Optional[Callable[[str], None]] = None,
     ) -> Dict[str, Any]:
-        _, schemas, _ = _load_tools_registry(fast_mode=fast_mode)
-        url = f"{self.config.base_url.rstrip('/')}/chat/completions"
+        """Execute a chat completion request and return the parsed response dictionary."""
+        raise NotImplementedError
+
+    def __call__(
+        self,
+        config: AgentConfig,
+        messages: Sequence[Dict[str, Any]],
+        tools: Optional[Sequence[Dict[str, Any]]] = None,
+        active_slot: Optional[int] = None,
+        stream_tokens: bool = False,
+        token_callback: Optional[Callable[[str], None]] = None,
+    ) -> Dict[str, Any]:
+        return self.complete(
+            config=config,
+            messages=messages,
+            tools=tools,
+            active_slot=active_slot,
+            stream_tokens=stream_tokens,
+            token_callback=token_callback,
+        )
+
+
+class HttpTransport(ColibriTransport):
+    """Production transport executing chat completions via `urllib.request` (SSE streaming + JSON)."""
+
+    def complete(
+        self,
+        config: AgentConfig,
+        messages: Sequence[Dict[str, Any]],
+        tools: Optional[Sequence[Dict[str, Any]]] = None,
+        active_slot: Optional[int] = None,
+        stream_tokens: bool = False,
+        token_callback: Optional[Callable[[str], None]] = None,
+    ) -> Dict[str, Any]:
+        url = f"{config.base_url.rstrip('/')}/chat/completions"
 
         payload: Dict[str, Any] = {
-            "model": self.config.model,
-            "messages": messages,
-            "temperature": self.config.temperature,
-            "max_tokens": self.config.max_tokens,
+            "model": config.model,
+            "messages": list(messages),
+            "temperature": config.temperature,
+            "max_tokens": config.max_tokens,
             "stream": bool(stream_tokens),
         }
-        payload.update(_colibri_extra_body(self.config, active_slot=active_slot))
-        if include_tools and schemas:
-            payload["tools"] = schemas
+        payload.update(_colibri_extra_body(config, active_slot=active_slot))
+        if tools:
+            payload["tools"] = list(tools)
             payload["tool_choice"] = "auto"
 
         headers = {
             "Content-Type": "application/json",
             "Accept": "text/event-stream" if stream_tokens else "application/json",
         }
-        if self.config.api_key:
-            headers["Authorization"] = f"Bearer {self.config.api_key}"
+        if config.api_key:
+            headers["Authorization"] = f"Bearer {config.api_key}"
 
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=self.config.request_timeout) as resp:
+        with urllib.request.urlopen(req, timeout=config.request_timeout) as resp:
             if not stream_tokens:
                 raw = resp.read().decode("utf-8", errors="replace")
                 return json.loads(raw)
@@ -810,11 +741,140 @@ class StdlibColibriAgent:
                 out_resp["compaction"] = compaction_info
             return out_resp
 
+
+# ==============================================================================
+# Unified Graph Runner: ColibriAgent
+# ==============================================================================
+
+class ColibriAgent:
+    """Unified StateGraph & ReAct runner for the Colibri AI Companion (`src/ai/graph.py`).
+
+    Encapsulates:
+    - Speculative zero-roundtrip local RAG memory prefetching (`data/memory_db/`)
+    - Two-slot KV cache prefix split (fast companion slot 0 vs full research slot 1)
+    - Intent routing (deterministic heuristics + zero-token SystemOne endpoint)
+    - Reflection guards against step budget exhaustion and malformed XML `<tool_call>` syntax
+    - Parallel tool execution delegating directly to `TOOL_REGISTRY_OBJ`
+    - Pluggable network transport (`ColibriTransport`)
+    - Native SQLite checkpointing and history continuity across thread sessions
+    """
+
+    runner_name = "stdlib"
+
+    def __init__(
+        self,
+        config: Optional[AgentConfig] = None,
+        system_prompt: str = SYSTEM_PROMPT,
+        transport: Optional[ColibriTransport] = None,
+        on_tool_call: Optional[Callable[[Dict[str, Any], str, float], None]] = None,
+        on_token: Optional[Callable[[str], None]] = None,
+        stream: bool = False,
+        checkpointer: Optional[ColibriSqliteCheckpointer] = None,
+    ) -> None:
+        self.config = config or AgentConfig()
+        self.system_prompt = system_prompt
+        self.transport = transport or HttpTransport()
+        self.on_tool_call = on_tool_call
+        self.on_token = on_token
+        self.stream = stream
+        self.checkpointer = checkpointer or ColibriSqliteCheckpointer()
+
+    def prefetch_memory(self, prompt_text: str) -> str:
+        """Prefetch personal facts from data/memory_db/ for zero-roundtrip local RAG context."""
+        return _prefetch_local_memory_context(prompt_text, self.config)
+
+    def classify_intent(self, prompt_text: str) -> str:
+        """Classify user intent into one of 5 canonical categories."""
+        return classify_user_intent(prompt_text, self.config)
+
+    def execute_tools(
+        self,
+        tool_calls: Sequence[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Execute one or more tool calls in parallel delegating directly to `TOOL_REGISTRY_OBJ`."""
+        if not tool_calls:
+            return []
+
+        from .tools import TOOL_REGISTRY_OBJ
+
+        def _worker(tc: Dict[str, Any]) -> Tuple[Dict[str, Any], str, float]:
+            t0 = time.monotonic()
+            name = str(tc.get("name") or tc.get("function", {}).get("name") or "")
+            args = tc.get("args")
+            if args is None:
+                args = tc.get("function", {}).get("arguments", "{}")
+            output = TOOL_REGISTRY_OBJ.execute(name, args, max_chars=self.config.max_tool_chars)
+            elapsed = time.monotonic() - t0
+            return tc, output, elapsed
+
+        max_workers = min(len(tool_calls), 6)
+        results: List[Dict[str, Any]] = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [pool.submit(_worker, tc) for tc in tool_calls]
+            for fut in futures:
+                tc, output, elapsed = fut.result()
+                tc_id = str(tc.get("id") or f"call_{len(results)}")
+                name = str(tc.get("name") or tc.get("function", {}).get("name") or "")
+                args = tc.get("args")
+                if args is None:
+                    args = tc.get("function", {}).get("arguments", "{}")
+                if self.on_tool_call is not None:
+                    try:
+                        self.on_tool_call({"id": tc_id, "name": name, "args": args}, output, elapsed)
+                    except Exception:  # noqa: BLE001
+                        pass
+                results.append(
+                    {
+                        "tool_call_id": tc_id,
+                        "name": name,
+                        "args": args,
+                        "content": output,
+                        "elapsed_s": round(elapsed, 3),
+                    }
+                )
+        return results
+
+    def _chat_completions(
+        self,
+        messages: List[Dict[str, Any]],
+        include_tools: bool = True,
+        fast_mode: bool = False,
+        active_slot: Optional[int] = None,
+        stream_tokens: bool = False,
+        token_callback: Optional[Callable[[str], None]] = None,
+    ) -> Dict[str, Any]:
+        """Dispatch chat completions request via the configured transport port."""
+        tools = None
+        if include_tools:
+            _, schemas, _ = _load_tools_registry(fast_mode=fast_mode)
+            tools = schemas
+        return self.transport.complete(
+            config=self.config,
+            messages=messages,
+            tools=tools,
+            active_slot=active_slot,
+            stream_tokens=stream_tokens,
+            token_callback=token_callback,
+        )
+
+    def run(
+        self,
+        prompt: str,
+        thread_id: str = "default",
+        history: Optional[Sequence[Dict[str, Any]]] = None,
+    ) -> AgentRunResult:
+        """Execute a prompt turn within the specified session thread."""
+        tid = (thread_id or "default").strip() or "default"
+        if history:
+            msgs = list(history) + [{"role": "user", "content": prompt}]
+            return self.invoke({"messages": msgs, "thread_id": tid})
+        return self.invoke(prompt, thread_id=tid)
+
     def invoke(
         self,
         state_or_prompt: Union[str, Dict[str, Any]],
         thread_id: Optional[str] = None,
-    ) -> Dict[str, Any]:
+    ) -> AgentRunResult:
         """Execute the `intent_router -> agent -> tools -> reflect_and_guard -> end` state machine."""
         resolved_thread_id = (thread_id or "").strip()
         if isinstance(state_or_prompt, str):
@@ -823,8 +883,11 @@ class StdlibColibriAgent:
             ]
             max_steps = self.config.max_iterations
         else:
-            if not resolved_thread_id and state_or_prompt.get("thread_id"):
-                resolved_thread_id = str(state_or_prompt.get("thread_id")).strip()
+            if not resolved_thread_id:
+                if state_or_prompt.get("thread_id"):
+                    resolved_thread_id = str(state_or_prompt.get("thread_id")).strip()
+                elif isinstance(state_or_prompt.get("configurable"), dict) and state_or_prompt["configurable"].get("thread_id"):
+                    resolved_thread_id = str(state_or_prompt["configurable"]["thread_id"]).strip()
             raw_msgs = state_or_prompt.get("messages", [])
             input_messages = []
             for m in raw_msgs:
@@ -833,9 +896,12 @@ class StdlibColibriAgent:
                 elif hasattr(m, "content"):
                     role = getattr(m, "type", "user")
                     role_map = {"human": "user", "ai": "assistant", "system": "system", "tool": "tool"}
-                    input_messages.append(
-                        {"role": role_map.get(role, role), "content": str(m.content)}
-                    )
+                    entry: Dict[str, Any] = {"role": role_map.get(role, role), "content": str(m.content)}
+                    if hasattr(m, "tool_call_id"):
+                        entry["tool_call_id"] = str(getattr(m, "tool_call_id", ""))
+                    if hasattr(m, "name"):
+                        entry["name"] = str(getattr(m, "name", ""))
+                    input_messages.append(entry)
             max_steps = int(state_or_prompt.get("max_steps") or self.config.max_iterations)
 
         checkpointer = self.checkpointer
@@ -857,18 +923,18 @@ class StdlibColibriAgent:
                 last_user_text = str(input_messages[idx].get("content") or "")
                 break
 
-        intent = classify_user_intent(last_user_text, self.config)
+        intent = self.classify_intent(last_user_text)
 
         # Optimization: Zero-roundtrip speculative local RAG lookup (<10ms)
         if last_user_idx >= 0 and "[LOCAL MEMORY CONTEXT]" not in last_user_text:
-            mem_ctx = _prefetch_local_memory_context(last_user_text, self.config)
+            mem_ctx = self.prefetch_memory(last_user_text)
             if mem_ctx:
                 input_messages[last_user_idx] = {
                     **input_messages[last_user_idx],
                     "content": last_user_text + mem_ctx,
                 }
 
-        # Optimization: Two-Slot Prefix Split (Slot 0 = Fast 9 Companion tools, Slot 1 = Full tools)
+        # Optimization: Two-Slot Prefix Split (Slot 0 = Fast Companion tools, Slot 1 = Full tools)
         use_fast_tools = bool(
             getattr(self.config, "fast_tool_pruning", False)
             and not _needs_full_research_suite(last_user_text)
@@ -895,7 +961,6 @@ class StdlibColibriAgent:
                 pass
 
         # Ensure static system prompt is always byte-identical at index 0 for KV cache prefix reuse
-        # (never inject dynamic RAG chunks into messages[0]; earlier turns are never mutated)
         if not input_messages or input_messages[0].get("role") != "system":
             messages: List[Dict[str, Any]] = [
                 {"role": "system", "content": self.system_prompt},
@@ -931,7 +996,7 @@ class StdlibColibriAgent:
         use_streaming = bool(self.stream or self.on_token is not None or tts_streamer is not None)
 
         while True:
-            # --- Node 1: `agent` ---
+            # --- Node: `agent` ---
             response = self._chat_completions(
                 messages,
                 include_tools=not force_finalize,
@@ -1003,20 +1068,16 @@ class StdlibColibriAgent:
                     and not force_finalize
                     and step_count < max_steps
                 ):
-                    # --- Node 3: `reflect_and_guard` (malformed tool call recovery) ---
+                    # --- Node: `reflect_and_guard` (malformed tool call recovery) ---
                     step_count += 1
                     force_finalize = True
                     messages.append({"role": "user", "content": _SYNTHESIS_NUDGE})
                     continue
                 break
 
-            # --- Node 2: `tools` (parallel tool execution) ---
+            # --- Node: `tools` (parallel tool execution delegating to TOOL_REGISTRY_OBJ) ---
             step_count += 1
-            exec_results = _execute_tool_calls_parallel(
-                normalized_calls,
-                max_chars=self.config.max_tool_chars,
-                on_tool_call=self.on_tool_call,
-            )
+            exec_results = self.execute_tools(normalized_calls)
             for res in exec_results:
                 tool_traces.append(res)
                 messages.append(
@@ -1028,7 +1089,7 @@ class StdlibColibriAgent:
                     }
                 )
 
-            # --- Node 3: `reflect_and_guard` (step budget check) ---
+            # --- Node: `reflect_and_guard` (step budget check) ---
             if step_count >= max_steps and not force_finalize:
                 force_finalize = True
                 messages.append({"role": "user", "content": _SYNTHESIS_NUDGE})
@@ -1044,6 +1105,12 @@ class StdlibColibriAgent:
 
         effective_tid = resolved_thread_id or "default"
         try:
+            checkpointer.save_checkpoint(
+                thread_id=effective_tid,
+                messages=messages,
+                intent=intent,
+                step_count=step_count,
+            )
             checkpointer.put(
                 {"configurable": {"thread_id": effective_tid}},
                 {
@@ -1075,20 +1142,45 @@ class StdlibColibriAgent:
         )
 
 
-if _LANGGRAPH_AVAILABLE:
-    from typing import Annotated
-    from langgraph.graph.message import add_messages
+# Backward-compatible alias
+StdlibColibriAgent = ColibriAgent
 
-    class InternetAgentState(TypedDict, total=False):
-        """State schema for the LangGraph Qwen3.6 internet research agent."""
 
-        messages: Annotated[List[BaseMessage], add_messages]
-        step_count: int
-        max_steps: int
-        tool_calls_log: List[Dict[str, Any]]
-        force_finalize: bool
-        intent: str
-        thread_id: str
+# Backward-compatible module-level tool execution helpers
+def _execute_single_tool(
+    name: str,
+    args: Union[str, Dict[str, Any]],
+    max_chars: int,
+) -> str:
+    """Execute one named tool safely and truncate its output via `TOOL_REGISTRY_OBJ`."""
+    from .tools import TOOL_REGISTRY_OBJ
+
+    return TOOL_REGISTRY_OBJ.execute(name, args, max_chars=max_chars)
+
+
+def _execute_tool_calls_parallel(
+    tool_calls: Sequence[Dict[str, Any]],
+    max_chars: int,
+    on_tool_call: Optional[Callable[[Dict[str, Any], str, float], None]] = None,
+) -> List[Dict[str, Any]]:
+    """Execute one or more tool calls in parallel delegating to `TOOL_REGISTRY_OBJ`."""
+    agent = ColibriAgent(
+        config=AgentConfig(max_tool_chars=max_chars),
+        on_tool_call=on_tool_call,
+    )
+    return agent.execute_tools(tool_calls)
+
+
+class InternetAgentState(TypedDict, total=False):
+    """State schema for the Colibri agent."""
+
+    messages: List[Any]
+    step_count: int
+    max_steps: int
+    tool_calls_log: List[Dict[str, Any]]
+    force_finalize: bool
+    intent: str
+    thread_id: str
 
 
 def build_internet_agent_graph(
@@ -1097,199 +1189,22 @@ def build_internet_agent_graph(
     on_token: Optional[Callable[[str], None]] = None,
     stream: bool = False,
     checkpointer: Optional[Any] = None,
-) -> Any:
-    """Build the Colibri Qwen3.6-35B-A3B internet research StateGraph.
+    transport: Optional[ColibriTransport] = None,
+) -> ColibriAgent:
+    """Build or return the unified `ColibriAgent` runner.
 
-    Uses `langgraph.graph.StateGraph` and `langchain_openai.ChatOpenAI` when
-    installed, or returns `StdlibColibriAgent` with a compatible `.invoke()`
-    interface when running in a zero-dependency environment.
+    Provides the complete StateGraph `.invoke()` and `.run()` execution pipeline
+    with stateful KV-cache prefixing, zero-generation SystemOne routing,
+    and native SQLite checkpointing.
     """
-    cfg = config or AgentConfig()
-    active_cp = checkpointer or ColibriSqliteCheckpointer()
-    if not _LANGGRAPH_AVAILABLE:
-        return StdlibColibriAgent(
-            config=cfg,
-            on_tool_call=on_tool_call,
-            on_token=on_token,
-            stream=stream,
-            checkpointer=active_cp,
-        )
-
-    use_fast = bool(getattr(cfg, "fast_tool_pruning", False))
-    _, _, get_lc_tools = _load_tools_registry(fast_mode=use_fast)
-    lc_tools = get_lc_tools()
-    extra_body = _colibri_extra_body(cfg)
-
-    llm = ChatOpenAI(
-        base_url=cfg.base_url,
-        api_key=cfg.api_key or "colibri",
-        model=cfg.model,
-        temperature=cfg.temperature,
-        max_tokens=cfg.max_tokens,
-        timeout=cfg.request_timeout,
-        streaming=bool(stream or on_token is not None or getattr(cfg, "stream_tts", False)),
-        extra_body=extra_body,
+    return ColibriAgent(
+        config=config,
+        on_tool_call=on_tool_call,
+        on_token=on_token,
+        stream=stream,
+        checkpointer=checkpointer,
+        transport=transport,
     )
-    llm_with_tools = llm.bind_tools(lc_tools) if lc_tools else llm
-
-    def agent_node(state: InternetAgentState) -> Dict[str, Any]:
-        msgs = list(state.get("messages") or [])
-        # Keep static SystemMessage at index 0 so Colibri cache_slot prefix stays valid
-        if not msgs or not isinstance(msgs[0], SystemMessage):
-            msgs = [SystemMessage(content=SYSTEM_PROMPT), *msgs]
-
-        force_finalize = bool(state.get("force_finalize", False))
-        active_llm = llm if force_finalize else llm_with_tools
-        if stream or on_token is not None or getattr(cfg, "stream_tts", False):
-            tts_streamer = None
-            if getattr(cfg, "stream_tts", False):
-                try:
-                    from .tools.audio import SentenceTTSStreamer
-
-                    tts_streamer = SentenceTTSStreamer(voice="auto", play_audio=True)
-                except Exception:  # noqa: BLE001
-                    tts_streamer = None
-            acc_chunk = None
-            for chunk in active_llm.stream(msgs):
-                c_text = str(getattr(chunk, "content", "") or "")
-                if c_text:
-                    if on_token is not None:
-                        on_token(c_text)
-                    if tts_streamer is not None:
-                        tts_streamer.feed(c_text)
-                acc_chunk = chunk if acc_chunk is None else acc_chunk + chunk
-            if tts_streamer is not None:
-                tts_streamer.flush()
-            if acc_chunk is not None:
-                ai_msg = AIMessage(
-                    content=str(getattr(acc_chunk, "content", "") or ""),
-                    tool_calls=list(getattr(acc_chunk, "tool_calls", None) or []),
-                )
-            else:
-                ai_msg = active_llm.invoke(msgs)
-        else:
-            ai_msg = active_llm.invoke(msgs)
-
-        # Salvage inline <tool_call> blocks if model emitted raw XML without parsed tool_calls
-        if (
-            isinstance(ai_msg, AIMessage)
-            and not getattr(ai_msg, "tool_calls", None)
-            and not force_finalize
-            and isinstance(ai_msg.content, str)
-        ):
-            salvaged = _salvage_inline_tool_calls(ai_msg.content)
-            if salvaged:
-                ai_msg.tool_calls = [
-                    {
-                        "id": tc["id"],
-                        "name": tc["name"],
-                        "args": tc["args"],
-                        "type": "tool_call",
-                    }
-                    for tc in salvaged
-                ]
-
-        updates: List[BaseMessage] = []
-        if not state.get("messages") or not isinstance(state["messages"][0], SystemMessage):
-            updates.append(SystemMessage(content=SYSTEM_PROMPT))
-        updates.append(ai_msg)
-        return {"messages": updates}
-
-    def tools_node(state: InternetAgentState) -> Dict[str, Any]:
-        msgs = state.get("messages") or []
-        last_msg = msgs[-1] if msgs else None
-        raw_calls = getattr(last_msg, "tool_calls", None) or []
-
-        normalized: List[Dict[str, Any]] = []
-        for idx, tc in enumerate(raw_calls):
-            normalized.append(
-                {
-                    "id": str(tc.get("id") or f"call_{idx}"),
-                    "name": str(tc.get("name") or ""),
-                    "args": tc.get("args", {}),
-                }
-            )
-
-        exec_results = _execute_tool_calls_parallel(
-            normalized,
-            max_chars=cfg.max_tool_chars,
-            on_tool_call=on_tool_call,
-        )
-        tool_messages: List[BaseMessage] = [
-            ToolMessage(
-                content=res["content"],
-                tool_call_id=res["tool_call_id"],
-                name=res["name"],
-            )
-            for res in exec_results
-        ]
-        prev_log = list(state.get("tool_calls_log") or [])
-        prev_log.extend(exec_results)
-        step_count = int(state.get("step_count") or 0) + 1
-        return {
-            "messages": tool_messages,
-            "step_count": step_count,
-            "tool_calls_log": prev_log,
-        }
-
-    def reflect_and_guard_node(state: InternetAgentState) -> Dict[str, Any]:
-        step_count = int(state.get("step_count") or 0)
-        max_steps = int(state.get("max_steps") or cfg.max_iterations)
-        msgs = state.get("messages") or []
-        last_msg = msgs[-1] if msgs else None
-        last_content = str(getattr(last_msg, "content", "") or "")
-
-        if step_count >= max_steps or "<tool_call>" in last_content:
-            return {
-                "force_finalize": True,
-                "messages": [HumanMessage(content=_SYNTHESIS_NUDGE)],
-            }
-        return {"force_finalize": False}
-
-    def route_after_agent(state: InternetAgentState) -> str:
-        msgs = state.get("messages") or []
-        last_msg = msgs[-1] if msgs else None
-        force_finalize = bool(state.get("force_finalize", False))
-        if force_finalize:
-            return END
-        if getattr(last_msg, "tool_calls", None):
-            return "tools"
-        last_content = str(getattr(last_msg, "content", "") or "")
-        if "<tool_call>" in last_content:
-            return "reflect_and_guard"
-        return END
-
-    def intent_router_node(state: InternetAgentState) -> Dict[str, Any]:
-        msgs = list(state.get("messages") or [])
-        last_user_content = ""
-        for m in reversed(msgs):
-            if isinstance(m, HumanMessage):
-                last_user_content = str(getattr(m, "content", "") or "")
-                break
-        detected_intent = state.get("intent") or classify_user_intent(last_user_content, cfg)
-        return {"intent": detected_intent}
-
-    graph = StateGraph(InternetAgentState)
-    graph.add_node("intent_router", intent_router_node)
-    graph.add_node("agent", agent_node)
-    graph.add_node("tools", tools_node)
-    graph.add_node("reflect_and_guard", reflect_and_guard_node)
-
-    graph.add_edge(START, "intent_router")
-    graph.add_edge("intent_router", "agent")
-    graph.add_conditional_edges(
-        "agent",
-        route_after_agent,
-        {
-            "tools": "tools",
-            "reflect_and_guard": "reflect_and_guard",
-            END: END,
-        },
-    )
-    graph.add_edge("tools", "reflect_and_guard")
-    graph.add_edge("reflect_and_guard", "agent")
-
-    return graph.compile(checkpointer=active_cp)
 
 
 def run_agent(
@@ -1302,18 +1217,11 @@ def run_agent(
     force_stdlib: bool = False,
     thread_id: Optional[str] = None,
     checkpointer: Optional[ColibriSqliteCheckpointer] = None,
+    transport: Optional[ColibriTransport] = None,
 ) -> AgentRunResult:
-    """Run the Colibri internet research agent on `prompt`.
-
-    Automatically uses the compiled LangGraph `StateGraph` with native SQLite
-    checkpointing when `langgraph` and `langchain_openai` are installed, or
-    falls back to `StdlibColibriAgent` (`urllib.request`) with identical
-    state machine semantics and native persistent SQLite checkpointing.
-    """
+    """Run the Colibri agent on `prompt` via the unified `ColibriAgent` runner."""
     cfg = config or AgentConfig()
     printed_via_stream = False
-    resolved_tid = (thread_id or "").strip()
-    active_cp = checkpointer or ColibriSqliteCheckpointer()
 
     def _stream_token_cb(tok: str) -> None:
         nonlocal printed_via_stream
@@ -1325,136 +1233,40 @@ def run_agent(
 
     token_cb = _stream_token_cb if (stream or on_token is not None) else None
 
-    compiled = build_internet_agent_graph(
+    agent = ColibriAgent(
         config=cfg,
         on_tool_call=on_tool_call,
         on_token=token_cb,
         stream=stream,
-        checkpointer=active_cp,
+        checkpointer=checkpointer,
+        transport=transport,
     )
 
-    if force_stdlib or not _LANGGRAPH_AVAILABLE:
-        msgs: List[Dict[str, Any]] = []
-        if history:
-            msgs.extend(history)
-        elif resolved_tid:
-            msgs.extend(get_session_history(resolved_tid))
-        msgs.append({"role": "user", "content": prompt})
-        invoke_payload: Dict[str, Any] = {"messages": msgs, "max_steps": cfg.max_iterations}
-        if resolved_tid:
-            invoke_payload["thread_id"] = resolved_tid
-        res = compiled.invoke(
-            invoke_payload,
-            thread_id=resolved_tid or None,
-        )
-        if stream:
-            if printed_via_stream:
-                print(flush=True)
-            elif res.answer:
-                print(res.answer, flush=True)
-        return res
-
-    effective_history = list(history) if history else (get_session_history(resolved_tid) if resolved_tid else [])
-    intent = classify_user_intent(prompt, cfg)
-
-    # Zero-roundtrip speculative local RAG lookup (<10ms)
-    enriched_prompt = prompt
-    if "[LOCAL MEMORY CONTEXT]" not in prompt:
-        mem_ctx = _prefetch_local_memory_context(prompt, cfg)
-        if mem_ctx:
-            enriched_prompt = prompt + mem_ctx
-
-    # Optional SystemOne zero-token routing (`use_systemone_routing`)
-    skip_tools_via_sys1 = False
-    if getattr(cfg, "use_systemone_routing", False) and prompt and not getattr(cfg, "is_ollama_or_metal", False):
-        try:
-            from .systemone import SystemOneClient
-
-            decision = SystemOneClient(config=cfg).route_query(prompt)
-            if decision.choice == "direct" and decision.confidence >= 0.65:
-                skip_tools_via_sys1 = True
-        except Exception:  # noqa: BLE001
-            pass
-
-    lc_messages: List[BaseMessage] = [SystemMessage(content=SYSTEM_PROMPT)]
-    if effective_history:
-        for m in effective_history:
-            role = m.get("role", "user")
-            content = str(m.get("content", ""))
-            if role == "system":
-                continue
-            elif role == "assistant":
-                lc_messages.append(AIMessage(content=content))
-            elif role == "tool":
-                lc_messages.append(
-                    ToolMessage(
-                        content=content,
-                        tool_call_id=str(m.get("tool_call_id", "call_hist")),
-                        name=str(m.get("name", "tool")),
-                    )
-                )
-            else:
-                lc_messages.append(HumanMessage(content=content))
-    lc_messages.append(HumanMessage(content=enriched_prompt))
-
-    initial_state: InternetAgentState = {
-        "messages": lc_messages,
-        "step_count": 0,
-        "max_steps": cfg.max_iterations,
-        "tool_calls_log": [],
-        "force_finalize": skip_tools_via_sys1,
-        "intent": intent,
-        "thread_id": resolved_tid or "default",
-    }
-    compile_config = {"configurable": {"thread_id": resolved_tid or "default"}}
-    try:
-        final_state = compiled.invoke(initial_state, config=compile_config)
-    except TypeError:
-        final_state = compiled.invoke(initial_state)
-
-    out_messages = final_state.get("messages") or []
-    final_answer = ""
-    for m in reversed(out_messages):
-        if isinstance(m, AIMessage) and m.content:
-            final_answer = str(m.content)
-            break
-
-    if resolved_tid:
-        serialized_msgs: List[Dict[str, Any]] = []
-        for m in out_messages:
-            role_map = {"system": "system", "human": "user", "ai": "assistant", "tool": "tool"}
-            role = role_map.get(getattr(m, "type", "user"), "user")
-            entry: Dict[str, Any] = {"role": role, "content": str(getattr(m, "content", ""))}
-            if role == "tool":
-                entry["tool_call_id"] = str(getattr(m, "tool_call_id", ""))
-                entry["name"] = str(getattr(m, "name", ""))
-            serialized_msgs.append(entry)
-        try:
-            active_cp.save_checkpoint(
-                thread_id=resolved_tid,
-                messages=serialized_msgs,
-                intent=str(final_state.get("intent") or intent),
-                step_count=int(final_state.get("step_count") or 0),
-            )
-        except Exception:  # noqa: BLE001
-            pass
+    resolved_tid = (thread_id or "").strip()
+    result = agent.run(prompt=prompt, thread_id=resolved_tid or "default", history=history)
 
     if stream:
         if printed_via_stream:
             print(flush=True)
-        elif final_answer:
-            print(final_answer, flush=True)
+        elif result.answer:
+            print(result.answer, flush=True)
 
-    return AgentRunResult(
-        answer=final_answer,
-        output=final_answer,
-        messages=serialized_msgs,
-        tool_calls=list(final_state.get("tool_calls_log") or []),
-        steps=int(final_state.get("step_count") or 0),
-        runner="langgraph",
-        model=cfg.model,
-        compacted_messages=0,
-        reasoning="",
-        intent=str(final_state.get("intent") or intent),
-        thread_id=resolved_tid or "default",
-    )
+    return result
+
+
+__all__ = [
+    "SYSTEM_PROMPT",
+    "AgentRunResult",
+    "ColibriAgent",
+    "ColibriSqliteCheckpointer",
+    "ColibriTransport",
+    "HttpTransport",
+    "InternetAgentState",
+    "StdlibColibriAgent",
+    "build_internet_agent_graph",
+    "classify_user_intent",
+    "get_langchain_tools",
+    "get_session_history",
+    "has_langgraph",
+    "run_agent",
+]

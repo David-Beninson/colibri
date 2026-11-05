@@ -155,6 +155,9 @@ class AgentConfig:
     research_cache_slot: int = field(
         default_factory=lambda: _env_int("COLIBRI_RESEARCH_CACHE_SLOT", 1)
     )
+    routing_cache_slot: int = field(
+        default_factory=lambda: _env_int("COLIBRI_ROUTING_CACHE_SLOT", 2)
+    )
     enable_thinking: bool = field(
         default_factory=lambda: _env_bool("COLIBRI_ENABLE_THINKING", False)
     )
@@ -223,13 +226,13 @@ class AgentConfig:
             return self.base_url[:-3]
         return self.base_url
 
-    def extra_body(self) -> Dict[str, Any]:
+    def extra_body(self, slot: Optional[int] = None) -> Dict[str, Any]:
         """Colibri-specific OpenAI request extensions for KV reuse and context compaction."""
         if self.is_ollama_or_metal:
             # Ollama / MLX Metal backends ignore or reject custom extra_body fields
             return {}
         body: Dict[str, Any] = {
-            "cache_slot": self.cache_slot,
+            "cache_slot": self.cache_slot if slot is None else slot,
             "enable_thinking": self.enable_thinking,
         }
         if self.preserve_thinking is not None:

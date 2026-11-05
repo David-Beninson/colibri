@@ -23,7 +23,10 @@ from unittest.mock import patch
 from src.ai.config import AgentConfig, detect_colibri_model
 from src.ai.graph import (
     SYSTEM_PROMPT,
+    ColibriAgent,
     ColibriSqliteCheckpointer,
+    ColibriTransport,
+    HttpTransport,
     StdlibColibriAgent,
     build_internet_agent_graph,
     classify_user_intent,
@@ -895,6 +898,138 @@ class ColibriAgentTestSuite(unittest.TestCase):
                     cp = ColibriSqliteCheckpointer().load_checkpoint("jimmies_family_session_1")
                     self.assertIsNotNone(cp)
                     self.assertEqual(cp["intent"], "recipe_scaling")
+
+    def test_colibri_agent_and_custom_transport(self) -> None:
+        """Verify unified ColibriAgent runner, pluggable ColibriTransport port, and HttpTransport."""
+        self.assertTrue(issubclass(HttpTransport, ColibriTransport))
+        self.assertIs(StdlibColibriAgent, ColibriAgent)
+
+        class _CustomTestTransport(ColibriTransport):
+            def __init__(self) -> None:
+                self.calls: List[Dict[str, Any]] = []
+
+            def complete(
+                self,
+                config: AgentConfig,
+                messages: Any,
+                tools: Any = None,
+                active_slot: Any = None,
+                stream_tokens: bool = False,
+                token_callback: Any = None,
+            ) -> Dict[str, Any]:
+                self.calls.append(
+                    {
+                        "messages": list(messages),
+                        "tools": list(tools) if tools else None,
+                        "slot": active_slot,
+                        "streaming": stream_tokens,
+                    }
+                )
+                if token_callback is not None:
+                    token_callback("Custom transport token.")
+
+                # If first turn, return a tool call to calculate; otherwise return final answer
+                has_tool_result = any(m.get("role") == "tool" for m in messages)
+                if not has_tool_result:
+                    return {
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": "",
+                                    "tool_calls": [
+                                        {
+                                            "id": "custom_call_001",
+                                            "type": "function",
+                                            "function": {
+                                                "name": "calculate",
+                                                "arguments": json.dumps({"expression": "100 / 4"}),
+                                            },
+                                        }
+                                    ],
+                                },
+                            }
+                        ]
+                    }
+                return {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": "The result is 25.",
+                            },
+                        }
+                    ]
+                }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            custom_transport = _CustomTestTransport()
+            cfg = AgentConfig(base_url=self.base_url, model="qwen36-35b")
+            cp = ColibriSqliteCheckpointer(db_path=os.path.join(tmpdir, "transport_test.sqlite"))
+            agent = ColibriAgent(config=cfg, transport=custom_transport, checkpointer=cp)
+
+            # 1. Test .run() with prompt string
+            run_res = agent.run("What is 100 / 4?", thread_id="thread_transport_test")
+            self.assertEqual(run_res.answer, "The result is 25.")
+            self.assertEqual(run_res.steps, 1)
+            self.assertEqual(len(run_res.tool_calls), 1)
+            self.assertEqual(run_res.tool_calls[0]["name"], "calculate")
+            self.assertEqual(len(custom_transport.calls), 2)
+            self.assertEqual(custom_transport.calls[0]["messages"][0]["role"], "system")
+
+            # 2. Test .invoke() with dict input format
+            dict_res = agent.invoke(
+                {"messages": [{"role": "user", "content": "Direct question"}], "max_steps": 2},
+                thread_id="thread_invoke_test",
+            )
+            self.assertIn("The result is 25.", dict_res["answer"])
+            self.assertIsInstance(dict_res, dict)
+
+            # 3. Test HttpTransport directly with JSON response and real SSE stream parsing
+            http_transport = HttpTransport()
+            with patch.object(urllib.request, "urlopen", side_effect=self.gateway.urlopen):
+                # JSON completion (turn 2 with tool message produces answer tokens)
+                streamed_tokens: List[str] = []
+                resp = http_transport.complete(
+                    config=cfg,
+                    messages=[
+                        {"role": "user", "content": "test"},
+                        {"role": "assistant", "content": ""},
+                        {"role": "tool", "content": "112"},
+                    ],
+                    stream_tokens=True,
+                    token_callback=lambda t: streamed_tokens.append(t),
+                )
+                self.assertIn("choices", resp)
+                self.assertGreaterEqual(len(streamed_tokens), 1)
+                self.assertIn("112", streamed_tokens[0])
+
+            # SSE line-by-line stream decoding
+            class _MockSSEResponse(io.BytesIO):
+                def __enter__(self) -> "_MockSSEResponse":
+                    return self
+
+                def __exit__(self, *args: Any) -> None:
+                    self.close()
+
+            sse_raw = (
+                b'data: {"choices": [{"delta": {"content": "Hello ", "reasoning_content": "think "}}]}\n\n'
+                b'data: {"choices": [{"delta": {"content": "world!"}}]}\n\n'
+                b"data: [DONE]\n\n"
+            )
+            sse_tokens: List[str] = []
+            with patch.object(urllib.request, "urlopen", return_value=_MockSSEResponse(sse_raw)):
+                parsed_sse = http_transport.complete(
+                    config=cfg,
+                    messages=[{"role": "user", "content": "hi"}],
+                    stream_tokens=True,
+                    token_callback=lambda t: sse_tokens.append(t),
+                )
+                self.assertEqual(parsed_sse["choices"][0]["message"]["content"], "Hello world!")
+                self.assertEqual(parsed_sse["choices"][0]["message"]["reasoning_content"], "think ")
+                self.assertEqual(sse_tokens, ["Hello ", "world!"])
 
 
 if __name__ == "__main__":

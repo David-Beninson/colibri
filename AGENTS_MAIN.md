@@ -12,19 +12,17 @@ src/ai/
 ├── config.py            # AgentConfig dataclass + auto-detection of served model & context window (/v1/models)
 ├── persona.py           # Bilingual (Hebrew/English) Noga (נוגה) companion persona & deterministic system prompt builder
 ├── systemone.py         # Client for Colibri's zero-generation decision endpoint (POST /v1/systemone)
-├── graph.py             # LangGraph StateGraph (agent -> tools -> reflect_and_guard -> end) + avatar state pulsing
-│                        # with zero-dependency StdlibColibriAgent fallback loop
-├── cli.py               # Interactive & one-shot CLI entry point (/tools, /avatar, /rotate, /birthday, /memory, /voice, /speak, /ocr)
-├── test_agent.py        # Self-contained unit test suite covering all 6 tool domains, persona, SSRF, and StateGraph
+├── graph.py             # Unified ColibriAgent ReAct runner & pluggable ColibriTransport seam
+│                        # (agent -> tools -> reflect_and_guard -> end) with native SQLite checkpointing
+├── cli.py               # Interactive & one-shot CLI entry point (/tools, /birthday, /memory, /voice, /speak, /ocr)
+├── test_agent.py        # Self-contained unit test suite covering all companion domains, persona, SSRF, and ColibriAgent
 └── tools/
-    ├── __init__.py      # Unified registry loader (`load_all_tool_suites`), `OPENAI_TOOLS_SCHEMA`, and `TOOL_REGISTRY`
+    ├── __init__.py      # Unified ToolRegistry loader, OPENAI_TOOLS_SCHEMA, and TOOL_REGISTRY
     ├── internet.py      # 11 SSRF-safe internet & utility tools (search, fetch, deep research, ArXiv, Wiki, HN, GitHub, Weather, RSS, math)
-    ├── vision.py        # Multilingual OCR (`heb+eng`), cascading scene description, and Haar-cascade person angle detection
+    ├── vision.py        # Multilingual OCR (`heb+eng`) and cascading scene description
     ├── audio.py         # Local OpenAI Whisper STT (`transcribe_audio`) + Edge-TTS bilingual synthesis (`he-IL-HilaNeural`)
-    ├── voice.py         # Convenience re-exports for voice/audio tools (`transcribe_audio`, `text_to_speech`, `speak_text`)
     ├── rag.py           # Private local RAG & fact vault persisted at `data/memory_db/` (`query_memory`, `save_fact`, ChromaDB + JSON)
-    ├── code_runner.py   # AST-sandboxed Python calculation & snippet runner (`run_python_calculation`)
-    └── device.py        # Raspberry Pi servo motor tracking & Pepper's Ghost 3D avatar states (`rotate_device`, `set_avatar_state`, `trigger_hologram_effect`)
+    └── code_runner.py   # AST-sandboxed Python calculation & snippet runner (`run_python_calculation`)
 ```
 
 ---
@@ -85,7 +83,7 @@ All URL fetches enforce strict SSRF protection (`_public_url`: only `http`/`http
 | `describe_image_scene` | Cascading visual scene analysis (Gemini Flash -> OpenRouter -> local Colibri vision -> OCR/PIL fallback). |
 | `detect_person_angle` | OpenCV Haar-cascade face detection mapped to a target servo pan angle (`-60°` to `+60°`). |
 
-### 4.3 Voice & Bilingual Audio (`src/ai/tools/audio.py` / `src/ai/tools/voice.py`)
+### 4.3 Voice & Bilingual Audio (`src/ai/tools/audio.py`)
 | Tool Name | Purpose |
 |---|---|
 | `transcribe_audio` | Local Speech-to-Text via `openai-whisper` with model caching and Hebrew/English detection. |
@@ -122,7 +120,7 @@ Before completing any modification to `src/ai/`, run and pass all checks:
 
 ```bash
 # 1. Syntax & bytecode compilation check
-python3 -m py_compile src/ai/__init__.py src/ai/config.py src/ai/persona.py src/ai/systemone.py src/ai/graph.py src/ai/cli.py src/ai/test_agent.py src/ai/tools/__init__.py src/ai/tools/internet.py src/ai/tools/vision.py src/ai/tools/audio.py src/ai/tools/voice.py src/ai/tools/rag.py src/ai/tools/code_runner.py src/ai/tools/device.py
+python3 -m py_compile src/ai/__init__.py src/ai/config.py src/ai/persona.py src/ai/systemone.py src/ai/graph.py src/ai/cli.py src/ai/test_agent.py src/ai/tools/__init__.py src/ai/tools/internet.py src/ai/tools/vision.py src/ai/tools/audio.py src/ai/tools/rag.py src/ai/tools/code_runner.py
 
 # 2. Run unit & integration test suite
 python3 -m unittest src.ai.test_agent -v

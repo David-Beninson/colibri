@@ -72,7 +72,7 @@ class SystemOneClient:
             "state": state,
             "questions": dict(questions),
             "normalize": normalize,
-            "cache_slot": self.config.cache_slot if cache_slot is None else cache_slot,
+            "cache_slot": self.config.routing_cache_slot if cache_slot is None else cache_slot,
         }
         if prefix is not None:
             body["prefix"] = prefix

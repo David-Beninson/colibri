@@ -394,3 +394,15 @@ AUDIO_TOOLS_SCHEMA: List[Dict[str, Any]] = [
         },
     },
 ]
+
+__all__ = [
+    "transcribe_audio",
+    "text_to_speech",
+    "speak_text",
+    "SentenceTTSStreamer",
+    "AUDIO_TOOLS",
+    "AUDIO_TOOL_REGISTRY",
+    "AUDIO_TOOLS_SCHEMA",
+    "_WHISPER_CACHE",
+    "_select_voice",
+]

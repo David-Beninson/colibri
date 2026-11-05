@@ -5,7 +5,7 @@ and ``POST /v1/systemone`` integration, bilingual Hebrew/English persona prompts
 and the companion tool suite:
 - Internet & Research (`src/ai/tools/internet.py`)
 - Vision & OCR (`src/ai/tools/vision.py`)
-- Hebrew/English Voice I/O (`src/ai/tools/audio.py` / `src/ai/tools/voice.py`)
+- Hebrew/English Voice I/O (`src/ai/tools/audio.py`)
 - Private Local RAG Memory (`src/ai/tools/rag.py`, persisted in `data/memory_db/`)
 - Safe Python Code Execution (`src/ai/tools/code_runner.py`)
 """
@@ -25,7 +25,10 @@ from .config import (
 from .graph import (
     SYSTEM_PROMPT,
     AgentRunResult,
+    ColibriAgent,
     ColibriSqliteCheckpointer,
+    ColibriTransport,
+    HttpTransport,
     StdlibColibriAgent,
     build_internet_agent_graph,
     classify_user_intent,
@@ -115,7 +118,10 @@ __all__ = [
     "build_system_prompt",
     "SYSTEM_PROMPT",
     "AgentRunResult",
+    "ColibriAgent",
     "ColibriSqliteCheckpointer",
+    "ColibriTransport",
+    "HttpTransport",
     "StdlibColibriAgent",
     "build_internet_agent_graph",
     "classify_user_intent",
