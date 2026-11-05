@@ -41,9 +41,38 @@ vision = [   # pictures through the gateway (the towers' preprocessors)
     "numpy",
     "pillow",
 ]
+agent = [    # Qwen3.6-35B-A3B LangGraph internet research, multimodal & System-1/2 agent
+    "langgraph>=0.2.0",
+    "langchain-openai>=0.2.0",
+    "langchain-core>=0.3.0",
+    "langchain-experimental>=0.0.60",
+    "duckduckgo-search>=6.0.0",
+    "trafilatura>=1.8.0",
+    "pytesseract>=0.3.10",
+    "Pillow>=10.0.0",
+    "openai-whisper>=20231117",
+    "edge-tts>=6.1.12",
+    "chromadb>=0.5.0",
+    "sentence-transformers>=3.0.0",
+]
+companion = [ # Full Desktop Holographic AI Companion suite
+    "langgraph>=0.2.0",
+    "langchain-openai>=0.2.0",
+    "langchain-core>=0.3.0",
+    "langchain-experimental>=0.0.60",
+    "duckduckgo-search>=6.0.0",
+    "trafilatura>=1.8.0",
+    "pytesseract>=0.3.10",
+    "Pillow>=10.0.0",
+    "openai-whisper>=20231117",
+    "edge-tts>=6.1.12",
+    "chromadb>=0.5.0",
+    "sentence-transformers>=3.0.0",
+]
 
 [project.scripts]
 coli = "colibri.cli:main"
+coli-agent = "src.ai.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/JustVugg/colibri"
@@ -54,4 +83,4 @@ version = {attr = "colibri._version.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["colibri*"]
+include = ["colibri*", "src*"]
