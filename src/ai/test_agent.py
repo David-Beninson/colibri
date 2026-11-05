@@ -21,6 +21,12 @@ from typing import Any, Dict, List
 from unittest.mock import patch
 
 from src.ai.config import AgentConfig, detect_colibri_model
+from src.ai.context import ConversationContext
+from src.ai.gateway import (
+    ColibriGatewayPort,
+    HttpGatewayAdapter,
+    InMemoryGatewayAdapter,
+)
 from src.ai.graph import (
     SYSTEM_PROMPT,
     ColibriAgent,
@@ -38,6 +44,11 @@ from src.ai.persona import (
     COMPANION_NAME,
     COMPANION_PERSONA_PROMPT,
     build_system_prompt,
+)
+from src.ai.session import (
+    InMemorySessionStore,
+    SessionStore,
+    SqliteSessionStore,
 )
 from src.ai.systemone import SystemOneClient
 from src.ai.tools import (
@@ -1065,6 +1076,297 @@ class ColibriAgentTestSuite(unittest.TestCase):
                 self.assertEqual(parsed_sse["choices"][0]["message"]["content"], "Hello world!")
                 self.assertEqual(parsed_sse["choices"][0]["message"]["reasoning_content"], "think ")
                 self.assertEqual(sse_tokens, ["Hello ", "world!"])
+
+    def test_in_memory_gateway_adapter_and_colibri_agent_without_mocks(self) -> None:
+        """Verify InMemoryGatewayAdapter port and test ColibriAgent with zero urllib monkey-patching."""
+        # 1. Verify ColibriGatewayPort hierarchy
+        self.assertTrue(issubclass(HttpGatewayAdapter, ColibriGatewayPort))
+        self.assertTrue(issubclass(InMemoryGatewayAdapter, ColibriGatewayPort))
+        self.assertTrue(issubclass(ColibriTransport, ColibriGatewayPort))
+
+        # 2. InMemoryGatewayAdapter direct operation and registration
+        gw = InMemoryGatewayAdapter()
+        models = gw.probe_models()
+        self.assertEqual(gw.models_calls, 1)
+        self.assertEqual(models[0]["id"], "qwen36-35b")
+
+        # Dynamic model detection using gateway seam
+        detected_id, detected_ctx = detect_colibri_model(gateway=gw)
+        self.assertEqual(detected_id, "qwen36-35b")
+        self.assertEqual(detected_ctx, 65536)
+
+        # 3. SystemOneClient using gateway seam directly
+        gw.register_systemone_response(
+            {
+                "model": "qwen36-35b",
+                "answers": {
+                    "q": {
+                        "choice": "companion_fast",
+                        "probabilities": {"companion_fast": 0.95, "direct": 0.05},
+                        "confidence": 0.95,
+                    }
+                },
+            }
+        )
+        sys1 = SystemOneClient(gateway=gw)
+        decision = sys1.route_query("What time is sunset tonight?")
+        self.assertEqual(decision.choice, "companion_fast")
+        self.assertAlmostEqual(decision.confidence, 0.95)
+        self.assertEqual(len(gw.systemone_calls), 1)
+        self.assertEqual(gw.systemone_calls[0]["slot"], 2)
+
+        # 4. Multi-turn ColibriAgent workflow with InMemoryGatewayAdapter (NO urllib mocking!)
+        gw.reset()
+        t1_response = {
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_inmem_01",
+                                "type": "function",
+                                "function": {
+                                    "name": "calculate",
+                                    "arguments": json.dumps({"expression": "7 * 6"}),
+                                },
+                            }
+                        ],
+                    },
+                }
+            ]
+        }
+        t2_response = {
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "7 multiplied by 6 is 42.",
+                    },
+                }
+            ]
+        }
+        gw.register_chat_response(t1_response)
+        gw.register_chat_response(t2_response)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = AgentConfig(base_url="http://mock-colibri.internal/v1", model="qwen36-35b")
+            cp = ColibriSqliteCheckpointer(db_path=os.path.join(tmpdir, "inmem_test.sqlite"))
+            agent = ColibriAgent(config=cfg, transport=gw, checkpointer=cp)
+
+            streamed_chunks: List[str] = []
+            res = agent.run("What is 7 * 6?")
+
+            self.assertEqual(res.answer, "7 multiplied by 6 is 42.")
+            self.assertEqual(res.steps, 1)
+            self.assertEqual(len(res.tool_calls), 1)
+            self.assertEqual(res.tool_calls[0]["name"], "calculate")
+            self.assertEqual(len(gw.chat_calls), 2)
+            # Verify slot preservation
+            self.assertEqual(gw.chat_calls[0]["slot"], 0)
+            self.assertEqual(gw.chat_calls[1]["slot"], 0)
+
+        # 5. Verify HttpGatewayAdapter error handling raises RuntimeError / ValueError
+        bad_adapter = HttpGatewayAdapter(base_url="http://127.0.0.1:1/v1", timeout=0.1)
+        with self.assertRaises(RuntimeError):
+            bad_adapter.probe_models()
+        with self.assertRaises(RuntimeError):
+            bad_adapter.complete_chat(messages=[{"role": "user", "content": "hello"}])
+        with self.assertRaises(RuntimeError):
+            bad_adapter.decide_systemone(state="test", questions={"q": {"type": "noul"}})
+
+    def test_session_store_standalone_and_inmemory(self) -> None:
+        """Verify SessionStore ABC, SqliteSessionStore, and InMemorySessionStore."""
+        self.assertTrue(issubclass(SqliteSessionStore, SessionStore))
+        self.assertTrue(issubclass(InMemorySessionStore, SessionStore))
+        self.assertIs(ColibriSqliteCheckpointer, SqliteSessionStore)
+
+        # 1. InMemorySessionStore lifecycle
+        mem = InMemorySessionStore()
+        self.assertEqual(mem.list_threads(), [])
+        self.assertIsNone(mem.load_checkpoint("t1"))
+        self.assertEqual(mem.get_history("t1"), [])
+        self.assertFalse(mem.clear("t1"))
+
+        # Save via dict
+        mem.save_checkpoint("t1", {
+            "messages": [
+                {"role": "system", "content": "system prompt"},
+                {"role": "user", "content": "Hello\n\n[LOCAL MEMORY CONTEXT] facts"},
+                {"role": "assistant", "content": "Hi!"},
+            ],
+            "intent": "conversation",
+            "step_count": 1,
+        })
+        self.assertEqual(mem.list_threads(), ["t1"])
+        cp1 = mem.load_checkpoint("t1")
+        self.assertIsNotNone(cp1)
+        self.assertEqual(cp1["intent"], "conversation")
+        self.assertEqual(cp1["step_count"], 1)
+        # Message cleaning stripped system prompt and transient suffix
+        self.assertEqual(len(cp1["messages"]), 2)
+        self.assertEqual(cp1["messages"][0]["content"], "Hello")
+        self.assertEqual(mem.get_history("t1")[1]["content"], "Hi!")
+
+        # LangGraph put, get_tuple, put_writes, list
+        cfg = {"configurable": {"thread_id": "t2"}}
+        ckpt = {
+            "v": 1,
+            "id": "chk_t2",
+            "channel_values": {
+                "messages": [{"role": "user", "content": "Ping"}],
+                "intent": "quick_query",
+                "step_count": 2,
+            },
+        }
+        mem.put(cfg, ckpt)
+        mem.put_writes(cfg, [("channel_a", "val_a")], task_id="task_001")
+        tup = mem.get_tuple(cfg)
+        self.assertIsNotNone(tup)
+        self.assertEqual(tup.checkpoint["channel_values"]["intent"], "quick_query")
+        listed = list(mem.list())
+        self.assertGreaterEqual(len(listed), 2)
+
+        # Clear
+        self.assertTrue(mem.clear("t1"))
+        self.assertIsNone(mem.load_checkpoint("t1"))
+
+        # 2. SqliteSessionStore lifecycle
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "session_test.sqlite")
+            sql_store = SqliteSessionStore(db_path=db_path)
+            self.assertEqual(sql_store.db_path, os.path.abspath(db_path))
+            self.assertEqual(sql_store.list_threads(), [])
+
+            # Save via sequence of messages
+            sql_store.save_checkpoint(
+                thread_id="sql_thread_1",
+                checkpoint_data=[
+                    {"role": "system", "content": "system prompt"},
+                    {"role": "user", "content": "What is 2+2?"},
+                    {"role": "assistant", "content": "4"},
+                ],
+                intent="calculation",
+                step_count=1,
+            )
+            self.assertIn("sql_thread_1", sql_store.list_threads())
+            hist = sql_store.get_history("sql_thread_1")
+            self.assertEqual(len(hist), 2)
+            self.assertEqual(hist[0]["content"], "What is 2+2?")
+
+            # Verify get_session_history helper
+            h2 = get_session_history("sql_thread_1", db_path=db_path)
+            self.assertEqual(len(h2), 2)
+
+            # Clear
+            self.assertTrue(sql_store.clear("sql_thread_1"))
+            self.assertFalse(sql_store.clear("sql_thread_1"))
+            self.assertEqual(sql_store.list_threads(), [])
+
+        # 3. Agent execution with InMemorySessionStore
+        gw = InMemoryGatewayAdapter()
+        gw.register_chat_response({
+            "choices": [{"message": {"role": "assistant", "content": "Session store active."}}]
+        })
+        mem_store = InMemorySessionStore()
+        agent = ColibriAgent(
+            config=AgentConfig(base_url="http://mock.internal/v1"),
+            transport=gw,
+            checkpointer=mem_store,
+        )
+        res = agent.run("Test message", thread_id="agent_thread")
+        self.assertEqual(res.answer, "Session store active.")
+        self.assertIn("agent_thread", mem_store.list_threads())
+        self.assertEqual(len(mem_store.get_history("agent_thread")), 2)
+
+    def test_conversation_context_prefix_preservation_and_slot_coordination(self) -> None:
+        """Verify ConversationContext KV-slot mapping, prefix preservation, and storage sanitization."""
+        # 1. Slot resolution
+        self.assertEqual(ConversationContext.resolve_slot("conversation"), 0)
+        self.assertEqual(ConversationContext.resolve_slot("memory_recall"), 0)
+        self.assertEqual(ConversationContext.resolve_slot("factual_extraction", requires_research=False), 0)
+        self.assertEqual(ConversationContext.resolve_slot("factual_extraction", requires_research=True), 1)
+        self.assertEqual(ConversationContext.resolve_slot("url_ingestion"), 1)
+        self.assertEqual(ConversationContext.resolve_slot("recipe_scaling"), 1)
+        self.assertEqual(ConversationContext.resolve_slot("research"), 1)
+        self.assertEqual(ConversationContext.resolve_slot("classification"), 2)
+        self.assertEqual(ConversationContext.resolve_slot("systemone"), 2)
+
+        # 2. Text cleaning helper
+        raw_text = "What is my mother's birthday?\n\n[LOCAL MEMORY CONTEXT]\n- mom_birthday: 1965-04-12"
+        self.assertEqual(ConversationContext.clean_user_text(raw_text), "What is my mother's birthday?")
+        self.assertEqual(ConversationContext.clean_user_text("Normal prompt"), "Normal prompt")
+        self.assertEqual(ConversationContext.clean_user_text(""), "")
+
+        # 3. from_turn and prefix preservation on wire payload
+        ctx = ConversationContext.from_turn(
+            prompt="What is my mother's birthday?",
+            system_prompt="DETERMINISTIC_COMPANION_PROMPT",
+            memory_context="- mom_birthday: 1965-04-12",
+            intent="memory_recall",
+        )
+        self.assertEqual(ctx.slot, 0)
+        wire_payload = ctx.to_llm_payload()
+        self.assertEqual(len(wire_payload), 2)
+        # Wire index 0 is always byte-identical system prompt
+        self.assertEqual(wire_payload[0]["role"], "system")
+        self.assertEqual(wire_payload[0]["content"], "DETERMINISTIC_COMPANION_PROMPT")
+        # Wire user message contains speculative memory context
+        self.assertEqual(wire_payload[1]["role"], "user")
+        self.assertIn("What is my mother's birthday?", wire_payload[1]["content"])
+        self.assertIn("[LOCAL MEMORY CONTEXT]", wire_payload[1]["content"])
+        self.assertIn("mom_birthday: 1965-04-12", wire_payload[1]["content"])
+
+        # 4. Storage messages sanitization (transient memory stripped, no system prompt)
+        ctx.messages.append({"role": "assistant", "content": "Her birthday is April 12th."})
+        storage = ctx.to_storage_messages()
+        self.assertEqual(len(storage), 2)
+        self.assertEqual(storage[0], {"role": "user", "content": "What is my mother's birthday?"})
+        self.assertEqual(storage[1], {"role": "assistant", "content": "Her birthday is April 12th."})
+
+        # 5. Multi-turn continuation with prior storage history
+        ctx2 = ConversationContext.from_turn(
+            prompt="What should I buy her?",
+            history=storage,
+            system_prompt="DETERMINISTIC_COMPANION_PROMPT",
+            memory_context="- likes: gardening",
+            intent="conversation",
+        )
+        wire2 = ctx2.to_llm_payload()
+        self.assertEqual(len(wire2), 4)
+        self.assertEqual(wire2[0]["role"], "system")
+        # Prior turn in wire2 is clean (no stale memory context)
+        self.assertEqual(wire2[1], {"role": "user", "content": "What is my mother's birthday?"})
+        self.assertEqual(wire2[2], {"role": "assistant", "content": "Her birthday is April 12th."})
+        # Active user turn has the new memory context
+        self.assertEqual(wire2[3]["role"], "user")
+        self.assertIn("What should I buy her?", wire2[3]["content"])
+        self.assertIn("likes: gardening", wire2[3]["content"])
+
+        # 6. ColibriAgent.run_turn execution & context binding
+        gw = InMemoryGatewayAdapter()
+        gw.register_chat_response({
+            "choices": [{"message": {"role": "assistant", "content": "A nice gardening kit."}}]
+        })
+        agent = ColibriAgent(
+            config=AgentConfig(base_url="http://mock.internal/v1"),
+            transport=gw,
+            checkpointer=InMemorySessionStore(),
+        )
+        turn_result = agent.run_turn(
+            "What should I get her for her birthday?",
+            history=storage,
+            thread_id="turn_integration_thread",
+        )
+        self.assertEqual(turn_result.answer, "A nice gardening kit.")
+        self.assertIsNotNone(turn_result.context)
+        self.assertIsInstance(turn_result.context, ConversationContext)
+        self.assertEqual(turn_result.context.slot, 0)
+        self.assertEqual(gw.chat_calls[0]["slot"], 0)
+        self.assertEqual(gw.chat_calls[0]["messages"][0]["role"], "system")
 
 
 if __name__ == "__main__":

@@ -10,7 +10,10 @@ import os
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
+
+if TYPE_CHECKING:
+    from .gateway import ColibriGatewayPort
 
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8000/v1"
@@ -84,13 +87,39 @@ def detect_colibri_model(
     base_url: str = DEFAULT_BASE_URL,
     api_key: str = DEFAULT_API_KEY,
     timeout: float = 3.0,
+    api_base: Optional[str] = None,
+    gateway: Optional[ColibriGatewayPort] = None,
 ) -> Tuple[str, int]:
     """Query ``GET /v1/models`` on the Colibri gateway and return ``(model_id, context_length)``.
 
     Falls back cleanly to ``("qwen36-35b", 65536)`` if the server is unreachable or
     does not advertise a model list.
     """
-    probed = _query_models_endpoint(base_url, api_key, timeout=timeout)
+    if gateway is not None:
+        try:
+            data = gateway.probe_models()
+            if isinstance(data, list) and data:
+                preferred = ("qwen36", "qwen3:30b-a3b", "qwen3", "qwen2.5:14b", "qwen2.5")
+                chosen = data[0] if isinstance(data[0], dict) else {}
+                for item in data:
+                    if isinstance(item, dict):
+                        mid = str(item.get("id") or "").lower()
+                        if any(p in mid for p in preferred):
+                            chosen = item
+                            break
+                model_id = str(chosen.get("id") or DEFAULT_MODEL)
+                ctx = (
+                    chosen.get("context_length")
+                    or chosen.get("max_model_len")
+                    or DEFAULT_CONTEXT_LENGTH
+                )
+                return model_id, int(ctx)
+        except Exception:  # noqa: BLE001
+            return DEFAULT_MODEL, DEFAULT_CONTEXT_LENGTH
+        return DEFAULT_MODEL, DEFAULT_CONTEXT_LENGTH
+
+    effective_url = api_base or base_url
+    probed = _query_models_endpoint(effective_url, api_key, timeout=timeout)
     if probed is not None:
         return probed
     return DEFAULT_MODEL, DEFAULT_CONTEXT_LENGTH

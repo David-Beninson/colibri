@@ -22,6 +22,12 @@ from .config import (
     detect_best_local_backend,
     detect_colibri_model,
 )
+from .context import ConversationContext
+from .gateway import (
+    ColibriGatewayPort,
+    HttpGatewayAdapter,
+    InMemoryGatewayAdapter,
+)
 from .graph import (
     SYSTEM_PROMPT,
     AgentRunResult,
@@ -42,6 +48,12 @@ from .persona import (
     COMPANION_PERSONA_PROMPT,
     RESEARCH_PERSONA_PROMPT,
     build_system_prompt,
+)
+from .session import (
+    InMemorySessionStore,
+    SessionStore,
+    SqliteSessionStore,
+    get_session_history,
 )
 from .systemone import (
     ChoiceDecision,
@@ -119,9 +131,16 @@ __all__ = [
     "SYSTEM_PROMPT",
     "AgentRunResult",
     "ColibriAgent",
+    "ColibriGatewayPort",
     "ColibriSqliteCheckpointer",
     "ColibriTransport",
+    "ConversationContext",
+    "HttpGatewayAdapter",
     "HttpTransport",
+    "InMemoryGatewayAdapter",
+    "InMemorySessionStore",
+    "SessionStore",
+    "SqliteSessionStore",
     "StdlibColibriAgent",
     "build_internet_agent_graph",
     "classify_user_intent",

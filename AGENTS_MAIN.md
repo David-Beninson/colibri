@@ -11,9 +11,11 @@ src/ai/
 ├── __init__.py          # Public package exports (AgentConfig, persona, SystemOneClient, 23+ tools, graph runner)
 ├── config.py            # AgentConfig dataclass + auto-detection of served model & context window (/v1/models)
 ├── persona.py           # English-only Jimmy bot companion persona & deterministic system prompt builder
+├── gateway.py           # Unified ColibriGatewayPort seam + HttpGatewayAdapter (urllib/SSE) & InMemoryGatewayAdapter
+├── session.py           # Standalone SessionStore seam + SqliteSessionStore (dual Colibri/LangGraph checkpointer) & InMemorySessionStore
+├── context.py           # ConversationContext: byte-deterministic KV prefix, slot coordinator, & storage sanitization
 ├── systemone.py         # Client for Colibri's zero-generation decision endpoint (POST /v1/systemone)
-├── graph.py             # Unified ColibriAgent ReAct runner & pluggable ColibriTransport seam
-│                        # (agent -> tools -> reflect_and_guard -> end) with native SQLite checkpointing
+├── graph.py             # Unified ColibriAgent ReAct runner (agent -> tools -> reflect_and_guard -> end)
 ├── cli.py               # Interactive & one-shot CLI entry point (/tools, /birthday, /memory, /voice, /speak, /ocr)
 ├── test_agent.py        # Self-contained unit test suite covering all companion domains, persona, SSRF, and ColibriAgent
 └── tools/
@@ -112,7 +114,7 @@ Before completing any modification to `src/ai/`, run and pass all checks:
 
 ```bash
 # 1. Syntax & bytecode compilation check
-python3 -m py_compile src/ai/__init__.py src/ai/config.py src/ai/persona.py src/ai/systemone.py src/ai/graph.py src/ai/cli.py src/ai/test_agent.py src/ai/tools/__init__.py src/ai/tools/internet.py src/ai/tools/vision.py src/ai/tools/audio.py src/ai/tools/rag.py src/ai/tools/code_runner.py
+python3 -m py_compile src/ai/__init__.py src/ai/config.py src/ai/persona.py src/ai/gateway.py src/ai/session.py src/ai/context.py src/ai/systemone.py src/ai/graph.py src/ai/cli.py src/ai/test_agent.py src/ai/tools/__init__.py src/ai/tools/internet.py src/ai/tools/vision.py src/ai/tools/audio.py src/ai/tools/rag.py src/ai/tools/code_runner.py
 
 # 2. Run unit & integration test suite
 python3 -m unittest src.ai.test_agent -v

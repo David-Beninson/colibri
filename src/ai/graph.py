@@ -9,23 +9,34 @@ Targets Qwen3.6-35B-A3B (`qwen36-35b`) served via `coli serve` with:
 - Parallel SSRF-safe tool execution delegating to `TOOL_REGISTRY_OBJ` with output truncation
 - Step-budget & malformed-tool reflection guard
 - Zero-roundtrip speculative local RAG memory prefetching
-- Native persistent SQLite session checkpointing (`ColibriSqliteCheckpointer`)
+- Native persistent SQLite session checkpointing (`SqliteSessionStore` / `ColibriSqliteCheckpointer`)
 """
 from __future__ import annotations
 
 import concurrent.futures
-import contextlib
-import datetime
 import json
 import os
 import re
-import sqlite3
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple, TypedDict, Union
+from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple, TypedDict, Union
 
 from .config import AgentConfig
+from .context import ConversationContext
+from .gateway import (
+    ColibriGatewayPort,
+    HttpGatewayAdapter,
+    InMemoryGatewayAdapter,
+)
+from .session import (
+    BaseCheckpointSaver,
+    CheckpointTuple,
+    InMemorySessionStore,
+    SessionStore,
+    SqliteSessionStore,
+    get_session_history,
+)
 
 try:
     from langchain_core.messages import (
@@ -41,27 +52,6 @@ try:
     _LANGGRAPH_AVAILABLE = True
 except ImportError:
     _LANGGRAPH_AVAILABLE = False
-
-try:
-    from langgraph.checkpoint.base import (
-        BaseCheckpointSaver,
-        Checkpoint,
-        CheckpointMetadata,
-        CheckpointTuple,
-    )
-
-    _LANGGRAPH_CP_AVAILABLE = True
-except ImportError:
-    class BaseCheckpointSaver:  # type: ignore
-        pass
-
-    class CheckpointTuple(NamedTuple):  # type: ignore
-        config: Dict[str, Any]
-        checkpoint: Dict[str, Any]
-        metadata: Dict[str, Any]
-        parent_config: Optional[Dict[str, Any]] = None
-
-    _LANGGRAPH_CP_AVAILABLE = False
 
 
 # Default fallback persona if `src/ai/persona.py` is not yet present
@@ -171,7 +161,7 @@ def classify_user_intent(prompt_text: str, config: Optional[AgentConfig] = None)
     - `"factual_extraction"`
     - `"conversation"`
     """
-    clean = (prompt_text or "").split("\n\n[LOCAL MEMORY CONTEXT]", 1)[0].strip()
+    clean = ConversationContext.clean_user_text(prompt_text)
     if not clean:
         return "conversation"
 
@@ -197,272 +187,17 @@ def classify_user_intent(prompt_text: str, config: Optional[AgentConfig] = None)
     return "conversation"
 
 
-class ColibriSqliteCheckpointer(BaseCheckpointSaver):
-    """Persistent zero-dependency SQLite checkpointer (`data/memory_db/checkpoints.sqlite`).
-
-    Saves and restores multi-turn session history (`thread_id`, `messages`, `intent`,
-    `step_count`, `updated_at`) across process restarts natively for both `ColibriAgent`
-    and LangGraph `StateGraph`.
-    """
-
-    def __init__(self, db_path: Optional[str] = None) -> None:
-        self._explicit_db_path = db_path
-
-    @property
-    def db_path(self) -> str:
-        if self._explicit_db_path:
-            parent = os.path.dirname(os.path.abspath(self._explicit_db_path))
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            return os.path.abspath(self._explicit_db_path)
-        from .tools.rag import _memory_dir
-
-        return os.path.join(_memory_dir(), "checkpoints.sqlite")
-
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=5.0)
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS session_checkpoints (
-                thread_id TEXT PRIMARY KEY,
-                messages_json TEXT NOT NULL,
-                intent TEXT NOT NULL DEFAULT 'conversation',
-                step_count INTEGER NOT NULL DEFAULT 0,
-                updated_at TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS checkpoint_writes (
-                thread_id TEXT NOT NULL,
-                task_id TEXT NOT NULL,
-                channel TEXT NOT NULL,
-                value_json TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                PRIMARY KEY (thread_id, task_id, channel)
-            )
-            """
-        )
-        return conn
-
-    @staticmethod
-    def _clean_messages_for_storage(messages: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Strip static system prompt and transient `[LOCAL MEMORY CONTEXT]` suffixes before persisting."""
-        cleaned: List[Dict[str, Any]] = []
-        for m in messages:
-            if not isinstance(m, dict):
-                continue
-            role = str(m.get("role") or "user")
-            if role == "system":
-                continue
-            item = dict(m)
-            if role == "user" and isinstance(item.get("content"), str):
-                item["content"] = item["content"].split("\n\n[LOCAL MEMORY CONTEXT]", 1)[0]
-            cleaned.append(item)
-        return cleaned
-
-    def save_checkpoint(
-        self,
-        thread_id: str,
-        messages: Sequence[Dict[str, Any]],
-        intent: str = "conversation",
-        step_count: int = 0,
-    ) -> None:
-        tid = (thread_id or "default").strip() or "default"
-        clean_msgs = self._clean_messages_for_storage(messages)
-        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        with contextlib.closing(self._connect()) as conn:
-            conn.execute(
-                """
-                INSERT INTO session_checkpoints (thread_id, messages_json, intent, step_count, updated_at)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(thread_id) DO UPDATE SET
-                    messages_json = excluded.messages_json,
-                    intent = excluded.intent,
-                    step_count = excluded.step_count,
-                    updated_at = excluded.updated_at
-                """,
-                (tid, json.dumps(clean_msgs, ensure_ascii=False), intent, int(step_count), now_iso),
-            )
-            conn.commit()
-
-    def load_checkpoint(self, thread_id: str) -> Optional[Dict[str, Any]]:
-        tid = (thread_id or "default").strip() or "default"
-        if not os.path.isfile(self.db_path):
-            return None
-        try:
-            with contextlib.closing(self._connect()) as conn:
-                row = conn.execute(
-                    "SELECT thread_id, messages_json, intent, step_count, updated_at FROM session_checkpoints WHERE thread_id = ?",
-                    (tid,),
-                ).fetchone()
-            if not row:
-                return None
-            return {
-                "thread_id": row[0],
-                "messages": json.loads(row[1]) if row[1] else [],
-                "intent": row[2],
-                "step_count": int(row[3] or 0),
-                "updated_at": row[4],
-            }
-        except Exception:  # noqa: BLE001
-            return None
-
-    def clear_checkpoint(self, thread_id: str) -> None:
-        tid = (thread_id or "default").strip() or "default"
-        if not os.path.isfile(self.db_path):
-            return
-        with contextlib.closing(self._connect()) as conn:
-            conn.execute("DELETE FROM session_checkpoints WHERE thread_id = ?", (tid,))
-            conn.commit()
-
-    def put(
-        self,
-        config: Dict[str, Any],
-        checkpoint: Dict[str, Any],
-        metadata: Optional[Dict[str, Any]] = None,
-        new_versions: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """LangGraph native checkpoint persistence protocol."""
-        configurable = config.get("configurable", {}) if isinstance(config, dict) else {}
-        tid = str(configurable.get("thread_id") or "default")
-        checkpoint_id = str(checkpoint.get("id") or f"chk_{int(time.time()*1000)}")
-        channel_values = checkpoint.get("channel_values", {})
-        if not isinstance(channel_values, dict):
-            channel_values = {}
-        messages = channel_values.get("messages", [])
-        intent = str(channel_values.get("intent") or "conversation")
-        step_count = int(channel_values.get("step_count") or 0)
-        self.save_checkpoint(thread_id=tid, messages=messages, intent=intent, step_count=step_count)
-        return {
-            "configurable": {
-                "thread_id": tid,
-                "checkpoint_ns": configurable.get("checkpoint_ns", ""),
-                "checkpoint_id": checkpoint_id,
-            }
-        }
-
-    def put_writes(
-        self,
-        config: Dict[str, Any],
-        writes: Sequence[Tuple[str, Any]],
-        task_id: str,
-    ) -> None:
-        """LangGraph task write staging protocol."""
-        configurable = config.get("configurable", {}) if isinstance(config, dict) else {}
-        tid = str(configurable.get("thread_id") or "default")
-        now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        try:
-            with self._connect() as conn:
-                for channel, value in writes:
-                    val_str = json.dumps(value, ensure_ascii=False) if not isinstance(value, str) else value
-                    conn.execute(
-                        """
-                        INSERT OR REPLACE INTO checkpoint_writes (thread_id, task_id, channel, value_json, created_at)
-                        VALUES (?, ?, ?, ?, ?)
-                        """,
-                        (tid, str(task_id), str(channel), val_str, now_iso),
-                    )
-                conn.commit()
-        except Exception:
-            pass
-
-    def get_tuple(self, config: Dict[str, Any]) -> Optional[CheckpointTuple]:
-        """LangGraph native checkpoint restoration protocol."""
-        configurable = config.get("configurable", {}) if isinstance(config, dict) else {}
-        tid = str(configurable.get("thread_id") or "default")
-        data = self.load_checkpoint(tid)
-        if not data:
-            return None
-        checkpoint_id = f"chk_{tid}"
-        ckpt = {
-            "v": 1,
-            "id": checkpoint_id,
-            "ts": data.get("updated_at") or datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "channel_values": {
-                "messages": data.get("messages") or [],
-                "intent": data.get("intent") or "conversation",
-                "step_count": int(data.get("step_count") or 0),
-            },
-            "channel_versions": {},
-            "versions_seen": {},
-        }
-        meta = {
-            "source": "input",
-            "step": int(data.get("step_count") or 0),
-            "writes": {},
-            "parents": {},
-        }
-        ret_cfg = {
-            "configurable": {
-                "thread_id": tid,
-                "checkpoint_ns": configurable.get("checkpoint_ns", ""),
-                "checkpoint_id": checkpoint_id,
-            }
-        }
-        return CheckpointTuple(config=ret_cfg, checkpoint=ckpt, metadata=meta, parent_config=None)
-
-    def list(
-        self,
-        config: Optional[Dict[str, Any]] = None,
-        *,
-        filter: Optional[Dict[str, Any]] = None,
-        before: Optional[Dict[str, Any]] = None,
-        limit: Optional[int] = None,
-    ):
-        """List checkpoint tuples matching thread_id."""
-        tid = None
-        if isinstance(config, dict):
-            tid = config.get("configurable", {}).get("thread_id")
-        with contextlib.closing(self._connect()) as conn:
-            if tid:
-                rows = conn.execute(
-                    "SELECT thread_id, messages_json, intent, step_count, updated_at FROM session_checkpoints WHERE thread_id = ? ORDER BY updated_at DESC",
-                    (tid,),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT thread_id, messages_json, intent, step_count, updated_at FROM session_checkpoints ORDER BY updated_at DESC",
-                ).fetchall()
-        count = 0
-        for row in rows:
-            if limit and count >= limit:
-                break
-            rtid = row[0]
-            r_msgs = json.loads(row[1]) if row[1] else []
-            r_intent = row[2] or "conversation"
-            r_step = int(row[3] or 0)
-            r_upd = row[4]
-            chk_id = f"chk_{rtid}"
-            ckpt = {
-                "v": 1,
-                "id": chk_id,
-                "ts": r_upd,
-                "channel_values": {"messages": r_msgs, "intent": r_intent, "step_count": r_step},
-                "channel_versions": {},
-                "versions_seen": {},
-            }
-            meta = {"source": "input", "step": r_step, "writes": {}, "parents": {}}
-            ret_cfg = {"configurable": {"thread_id": rtid, "checkpoint_ns": "", "checkpoint_id": chk_id}}
-            yield CheckpointTuple(config=ret_cfg, checkpoint=ckpt, metadata=meta, parent_config=None)
-            count += 1
-
-
-def get_session_history(thread_id: str = "default", db_path: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Return persisted conversational messages for `thread_id` from `checkpoints.sqlite`."""
-    cp = ColibriSqliteCheckpointer(db_path=db_path).load_checkpoint(thread_id)
-    if not cp:
-        return []
-    return list(cp.get("messages") or [])
+# Alias for 100% backwards compatibility with existing callers
+ColibriSqliteCheckpointer = SqliteSessionStore
 
 
 def _needs_full_research_suite(prompt_text: str) -> bool:
     """Return True if the user query explicitly mentions research/vision/code domains outside the fast companion suite."""
-    intent = classify_user_intent(prompt_text)
+    clean = ConversationContext.clean_user_text(prompt_text)
+    intent = classify_user_intent(clean)
     if intent in ("url_ingestion", "recipe_scaling"):
         return True
-    return bool(_RESEARCH_KEYWORDS_RE.search(prompt_text or ""))
+    return bool(_RESEARCH_KEYWORDS_RE.search(clean))
 
 
 def _prefetch_local_memory_context(prompt_text: str, config: AgentConfig) -> str:
@@ -476,7 +211,7 @@ def _prefetch_local_memory_context(prompt_text: str, config: AgentConfig) -> str
     """
     if not getattr(config, "prefetch_memory", True) or not prompt_text:
         return ""
-    clean_query = prompt_text.split("\n\n[LOCAL MEMORY CONTEXT]", 1)[0].strip()
+    clean_query = ConversationContext.clean_user_text(prompt_text)
     if not clean_query:
         return ""
     try:
@@ -593,6 +328,10 @@ class AgentRunResult(dict):
     def thread_id(self) -> str:
         return str(self.get("thread_id", "default"))
 
+    @property
+    def context(self) -> Any:
+        return self.get("context")
+
     def __getattr__(self, name: str) -> Any:
         if name in self:
             return self[name]
@@ -613,11 +352,11 @@ class AgentRunResult(dict):
 # Network Transport Seam (Transport Port & Adapters)
 # ==============================================================================
 
-class ColibriTransport:
-    """Abstract network transport port for Colibri / OpenAI-compatible chat completions.
+class ColibriTransport(ColibriGatewayPort):
+    """Network transport port for Colibri / OpenAI-compatible chat completions.
 
-    Allows injecting alternative transport implementations (e.g. `urllib`, `httpx`, or in-memory mocks)
-    without modifying agent workflow logic.
+    Inherits from ColibriGatewayPort, retaining full backwards compatibility with
+    legacy `.complete()` callers and subclasses while participating in the unified gateway seam.
     """
 
     def complete(
@@ -632,27 +371,60 @@ class ColibriTransport:
         """Execute a chat completion request and return the parsed response dictionary."""
         raise NotImplementedError
 
-    def __call__(
+    def complete_chat(
         self,
-        config: AgentConfig,
         messages: Sequence[Dict[str, Any]],
         tools: Optional[Sequence[Dict[str, Any]]] = None,
-        active_slot: Optional[int] = None,
-        stream_tokens: bool = False,
-        token_callback: Optional[Callable[[str], None]] = None,
+        slot: int = 0,
+        stream: bool = False,
+        on_token: Optional[Callable[[str], None]] = None,
+        extra_body: Optional[Dict[str, Any]] = None,
+        temperature: float = 0.7,
+        max_tokens: Optional[int] = None,
+        model: Optional[str] = None,
     ) -> Dict[str, Any]:
+        class _LegacyConfig:
+            def __init__(self) -> None:
+                self.cache_slot = slot
+                self.temperature = temperature
+                self.max_tokens = max_tokens
+                self.model = model or "qwen36-35b"
+                self.preserve_thinking = True
+                self.compact = "auto"
+                self.is_ollama_or_metal = False
+
+            def extra_body(self, slot: Optional[int] = None) -> Dict[str, Any]:
+                return dict(extra_body or {})
+
         return self.complete(
-            config=config,
+            config=_LegacyConfig(),  # type: ignore[arg-type]
             messages=messages,
             tools=tools,
-            active_slot=active_slot,
-            stream_tokens=stream_tokens,
-            token_callback=token_callback,
+            active_slot=slot,
+            stream_tokens=stream,
+            token_callback=on_token,
         )
 
+    def decide_systemone(
+        self,
+        state: Any = None,
+        questions: Optional[Mapping[str, Any]] = None,
+        slot: int = 2,
+        normalize: Union[bool, str] = True,
+        extra_body: Optional[Dict[str, Any]] = None,
+        model: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        return {}
 
-class HttpTransport(ColibriTransport):
+    def probe_models(self) -> List[Dict[str, Any]]:
+        return []
+
+
+class HttpTransport(HttpGatewayAdapter, ColibriTransport):
     """Production transport executing chat completions via `urllib.request` (SSE streaming + JSON)."""
+
+    def __init__(self, config: Optional[AgentConfig] = None) -> None:
+        super().__init__(config=config)
 
     def complete(
         self,
@@ -663,113 +435,25 @@ class HttpTransport(ColibriTransport):
         stream_tokens: bool = False,
         token_callback: Optional[Callable[[str], None]] = None,
     ) -> Dict[str, Any]:
-        url = f"{config.base_url.rstrip('/')}/chat/completions"
+        if config is not None:
+            self.base_url = config.base_url
+            self.api_key = config.api_key
+            self.model = config.model
+            self.timeout = config.request_timeout
 
-        payload: Dict[str, Any] = {
-            "model": config.model,
-            "messages": list(messages),
-            "temperature": config.temperature,
-            "max_tokens": config.max_tokens,
-            "stream": bool(stream_tokens),
-        }
+        slot = config.cache_slot if active_slot is None else active_slot
         extra = _colibri_extra_body(config, active_slot=active_slot)
-        payload.update(extra)
-        if extra:
-            payload["extra_body"] = dict(extra)
-        if tools:
-            payload["tools"] = list(tools)
-            payload["tool_choice"] = "auto"
-
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream" if stream_tokens else "application/json",
-        }
-        if config.api_key:
-            headers["Authorization"] = f"Bearer {config.api_key}"
-
-        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=config.request_timeout) as resp:
-            if not stream_tokens:
-                raw = resp.read().decode("utf-8", errors="replace")
-                return json.loads(raw)
-
-            content_parts: List[str] = []
-            reasoning_parts: List[str] = []
-            tool_calls_acc: Dict[int, Dict[str, Any]] = {}
-            compaction_info: Optional[Dict[str, Any]] = None
-
-            raw_bytes = resp.read()
-            raw_text = raw_bytes.decode("utf-8", errors="replace")
-            # Support both standard JSON (e.g. non-SSE mock servers) and SSE `data: ...` streams
-            if raw_text.lstrip().startswith("{"):
-                parsed_json = json.loads(raw_text)
-                choices = parsed_json.get("choices") or []
-                msg = (choices[0].get("message") if choices else None) or {}
-                c_str = str(msg.get("content") or "")
-                if c_str and token_callback:
-                    token_callback(c_str)
-                return parsed_json
-
-            for line in raw_text.splitlines():
-                line_s = line.strip()
-                if not line_s.startswith("data:"):
-                    continue
-                data_str = line_s[5:].strip()
-                if not data_str or data_str == "[DONE]":
-                    continue
-                try:
-                    chunk = json.loads(data_str)
-                except Exception:  # noqa: BLE001
-                    continue
-                if isinstance(chunk.get("compaction"), dict):
-                    compaction_info = chunk["compaction"]
-                choices = chunk.get("choices") or []
-                if not choices:
-                    continue
-                delta = choices[0].get("delta") or choices[0].get("message") or {}
-                c_delta = delta.get("content")
-                if c_delta:
-                    content_parts.append(str(c_delta))
-                    if token_callback is not None:
-                        token_callback(str(c_delta))
-                r_delta = delta.get("reasoning_content")
-                if r_delta:
-                    reasoning_parts.append(str(r_delta))
-                for tc_delta in delta.get("tool_calls") or []:
-                    idx = int(tc_delta.get("index", 0))
-                    entry = tool_calls_acc.setdefault(
-                        idx,
-                        {
-                            "id": tc_delta.get("id") or f"call_stream_{idx}",
-                            "type": "function",
-                            "function": {"name": "", "arguments": ""},
-                        },
-                    )
-                    if tc_delta.get("id"):
-                        entry["id"] = tc_delta["id"]
-                    fn_d = tc_delta.get("function") or {}
-                    if fn_d.get("name"):
-                        entry["function"]["name"] += str(fn_d["name"])
-                    if fn_d.get("arguments"):
-                        entry["function"]["arguments"] += str(fn_d["arguments"])
-
-            assembled_msg: Dict[str, Any] = {
-                "role": "assistant",
-                "content": "".join(content_parts),
-            }
-            if reasoning_parts:
-                assembled_msg["reasoning_content"] = "".join(reasoning_parts)
-            if tool_calls_acc:
-                assembled_msg["tool_calls"] = [
-                    tool_calls_acc[k] for k in sorted(tool_calls_acc)
-                ]
-            out_resp: Dict[str, Any] = {
-                "choices": [{"index": 0, "message": assembled_msg}],
-            }
-            if compaction_info is not None:
-                out_resp["compaction"] = compaction_info
-            return out_resp
+        return self.complete_chat(
+            messages=messages,
+            tools=tools,
+            slot=slot,
+            stream=stream_tokens,
+            on_token=token_callback,
+            extra_body=extra,
+            temperature=config.temperature,
+            max_tokens=config.max_tokens,
+            model=config.model,
+        )
 
 
 # ==============================================================================
@@ -795,19 +479,19 @@ class ColibriAgent:
         self,
         config: Optional[AgentConfig] = None,
         system_prompt: str = SYSTEM_PROMPT,
-        transport: Optional[ColibriTransport] = None,
+        transport: Optional[ColibriGatewayPort] = None,
         on_tool_call: Optional[Callable[[Dict[str, Any], str, float], None]] = None,
         on_token: Optional[Callable[[str], None]] = None,
         stream: bool = False,
-        checkpointer: Optional[ColibriSqliteCheckpointer] = None,
+        checkpointer: Optional[Union[SqliteSessionStore, SessionStore]] = None,
     ) -> None:
         self.config = config or AgentConfig()
         self.system_prompt = system_prompt
-        self.transport = transport or HttpTransport()
+        self.transport: ColibriGatewayPort = transport or HttpGatewayAdapter(config=self.config)
         self.on_tool_call = on_tool_call
         self.on_token = on_token
         self.stream = stream
-        self.checkpointer = checkpointer or ColibriSqliteCheckpointer()
+        self.checkpointer = checkpointer or SqliteSessionStore()
 
     def prefetch_memory(self, prompt_text: str) -> str:
         """Prefetch personal facts from data/memory_db/ for zero-roundtrip local RAG context."""
@@ -873,11 +557,28 @@ class ColibriAgent:
         stream_tokens: bool = False,
         token_callback: Optional[Callable[[str], None]] = None,
     ) -> Dict[str, Any]:
-        """Dispatch chat completions request via the configured transport port."""
+        """Dispatch chat completions request via the configured gateway/transport port."""
         tools = None
         if include_tools:
             _, schemas, _ = _load_tools_registry(fast_mode=fast_mode)
             tools = schemas
+
+        slot = self.config.cache_slot if active_slot is None else active_slot
+        extra = _colibri_extra_body(self.config, active_slot=active_slot)
+
+        if hasattr(self.transport, "complete_chat"):
+            return self.transport.complete_chat(
+                messages=messages,
+                tools=tools,
+                slot=slot,
+                stream=stream_tokens,
+                on_token=token_callback,
+                extra_body=extra,
+                temperature=self.config.temperature,
+                max_tokens=self.config.max_tokens,
+                model=self.config.model,
+            )
+
         return self.transport.complete(
             config=self.config,
             messages=messages,
@@ -887,6 +588,39 @@ class ColibriAgent:
             token_callback=token_callback,
         )
 
+    def run_turn(
+        self,
+        prompt: str,
+        history: Optional[Sequence[Dict[str, Any]]] = None,
+        thread_id: str = "default",
+        memory_context: Optional[str] = None,
+        system_prompt: Optional[str] = None,
+        intent: Optional[str] = None,
+        slot: Optional[int] = None,
+    ) -> AgentRunResult:
+        """Execute a conversational turn using ConversationContext."""
+        tid = (thread_id or "default").strip() or "default"
+        clean_prompt = ConversationContext.clean_user_text(prompt)
+        resolved_intent = intent or self.classify_intent(clean_prompt)
+        needs_research = _needs_full_research_suite(clean_prompt)
+        mem_ctx = memory_context
+        if mem_ctx is None and "[LOCAL MEMORY CONTEXT]" not in prompt:
+            mem_ctx = self.prefetch_memory(clean_prompt) or None
+
+        resolved_slot = slot if slot is not None else ConversationContext.resolve_slot(
+            resolved_intent, requires_research=needs_research
+        )
+        ctx = ConversationContext.from_turn(
+            prompt=clean_prompt,
+            history=history,
+            system_prompt=system_prompt or self.system_prompt,
+            memory_context=mem_ctx,
+            intent=resolved_intent,
+            requires_research=needs_research,
+            slot=resolved_slot,
+        )
+        return self.invoke(ctx, thread_id=tid)
+
     def run(
         self,
         prompt: str,
@@ -894,21 +628,27 @@ class ColibriAgent:
         history: Optional[Sequence[Dict[str, Any]]] = None,
     ) -> AgentRunResult:
         """Execute a prompt turn within the specified session thread."""
-        tid = (thread_id or "default").strip() or "default"
-        if history:
-            msgs = list(history) + [{"role": "user", "content": prompt}]
-            return self.invoke({"messages": msgs, "thread_id": tid})
-        return self.invoke(prompt, thread_id=tid)
+        return self.run_turn(
+            prompt=prompt,
+            history=history,
+            thread_id=thread_id,
+        )
 
     def invoke(
         self,
-        state_or_prompt: Union[str, Dict[str, Any]],
+        state_or_prompt: Union[str, Dict[str, Any], ConversationContext],
         thread_id: Optional[str] = None,
     ) -> AgentRunResult:
         """Execute the `intent_router -> agent -> tools -> reflect_and_guard -> end` state machine."""
         resolved_thread_id = (thread_id or "").strip()
-        if isinstance(state_or_prompt, str):
-            input_messages: List[Dict[str, Any]] = [
+        ctx: Optional[ConversationContext] = None
+
+        if isinstance(state_or_prompt, ConversationContext):
+            ctx = state_or_prompt
+            input_messages: List[Dict[str, Any]] = list(ctx.messages)
+            max_steps = self.config.max_iterations
+        elif isinstance(state_or_prompt, str):
+            input_messages = [
                 {"role": "user", "content": state_or_prompt}
             ]
             max_steps = self.config.max_iterations
@@ -953,25 +693,45 @@ class ColibriAgent:
                 last_user_text = str(input_messages[idx].get("content") or "")
                 break
 
-        intent = self.classify_intent(last_user_text)
+        clean_user_text = ConversationContext.clean_user_text(last_user_text)
+        intent = self.classify_intent(clean_user_text)
 
         # Optimization: Zero-roundtrip speculative local RAG lookup (<10ms)
+        mem_ctx = ""
         if last_user_idx >= 0 and "[LOCAL MEMORY CONTEXT]" not in last_user_text:
-            mem_ctx = self.prefetch_memory(last_user_text)
-            if mem_ctx:
-                input_messages[last_user_idx] = {
-                    **input_messages[last_user_idx],
-                    "content": last_user_text + mem_ctx,
-                }
+            mem_ctx = self.prefetch_memory(clean_user_text)
 
         # Optimization: Two-Slot Prefix Split (Slot 0 = Fast Companion tools, Slot 1 = Full tools)
-        needs_research = _needs_full_research_suite(last_user_text)
+        needs_research = _needs_full_research_suite(clean_user_text)
         use_fast_tools = bool(
             getattr(self.config, "fast_tool_pruning", False)
             and not needs_research
         )
         research_slot = getattr(self.config, "research_cache_slot", 1)
         active_slot = research_slot if needs_research else self.config.cache_slot
+
+        # Build or synchronize ConversationContext
+        if ctx is None:
+            ctx = ConversationContext.from_turn(
+                prompt=clean_user_text,
+                history=input_messages[:last_user_idx] if last_user_idx >= 0 else input_messages,
+                system_prompt=self.system_prompt,
+                memory_context=mem_ctx or None,
+                intent=intent,
+                requires_research=needs_research,
+                slot=active_slot,
+            )
+            if last_user_idx >= 0 and last_user_idx + 1 < len(input_messages):
+                ctx.messages.extend(input_messages[last_user_idx + 1:])
+        else:
+            if not ctx.memory_context and mem_ctx:
+                ctx.memory_context = mem_ctx
+            ctx.intent = intent
+            ctx.slot = active_slot
+            if len(input_messages) > len(ctx.messages):
+                ctx.messages = input_messages
+
+        messages: List[Dict[str, Any]] = ctx.to_llm_payload(slot=active_slot)
 
         # Optimization: Optional SystemOne zero-token routing (`use_systemone_routing`)
         skip_tools_via_sys1 = bool(
@@ -980,18 +740,6 @@ class ColibriAgent:
             and not getattr(self.config, "is_ollama_or_metal", False)
             and intent == "conversation"
         )
-
-        # Ensure static system prompt is always byte-identical at index 0 for KV cache prefix reuse
-        if not input_messages or input_messages[0].get("role") != "system":
-            messages: List[Dict[str, Any]] = [
-                {"role": "system", "content": self.system_prompt},
-                *input_messages,
-            ]
-        else:
-            messages = [
-                {"role": "system", "content": self.system_prompt},
-                *input_messages[1:],
-            ]
 
         step_count = 0
         tool_traces: List[Dict[str, Any]] = []
@@ -1125,10 +873,16 @@ class ColibriAgent:
             tts_streamer.flush()
 
         effective_tid = resolved_thread_id or "default"
+        if ctx is not None:
+            ctx.messages = messages
+            storage_messages = ctx.to_storage_messages()
+        else:
+            storage_messages = messages
+
         try:
             checkpointer.save_checkpoint(
                 thread_id=effective_tid,
-                messages=messages,
+                messages=storage_messages,
                 intent=intent,
                 step_count=step_count,
             )
@@ -1138,7 +892,7 @@ class ColibriAgent:
                     "v": 1,
                     "id": f"chk_{effective_tid}",
                     "channel_values": {
-                        "messages": messages,
+                        "messages": storage_messages,
                         "intent": intent,
                         "step_count": step_count,
                     },
@@ -1159,7 +913,9 @@ class ColibriAgent:
             compacted_messages=compacted_messages,
             reasoning=last_reasoning,
             intent=intent,
+            slot=active_slot,
             thread_id=effective_tid,
+            context=ctx,
         )
 
 
@@ -1209,8 +965,8 @@ def build_internet_agent_graph(
     on_tool_call: Optional[Callable[[Dict[str, Any], str, float], None]] = None,
     on_token: Optional[Callable[[str], None]] = None,
     stream: bool = False,
-    checkpointer: Optional[Any] = None,
-    transport: Optional[ColibriTransport] = None,
+    checkpointer: Optional[Union[SqliteSessionStore, SessionStore, Any]] = None,
+    transport: Optional[ColibriGatewayPort] = None,
     force_stdlib: bool = False,
 ) -> Any:
     """Build or return the unified `ColibriAgent` runner or compiled StateGraph.
@@ -1220,7 +976,7 @@ def build_internet_agent_graph(
     and StateGraph-compatible execution interface.
     """
     cfg = config or AgentConfig()
-    active_cp = checkpointer or ColibriSqliteCheckpointer()
+    active_cp = checkpointer or SqliteSessionStore()
     if not _LANGGRAPH_AVAILABLE or force_stdlib:
         return ColibriAgent(
             config=cfg,
@@ -1403,8 +1159,8 @@ def run_agent(
     on_token: Optional[Callable[[str], None]] = None,
     force_stdlib: bool = False,
     thread_id: Optional[str] = None,
-    checkpointer: Optional[ColibriSqliteCheckpointer] = None,
-    transport: Optional[ColibriTransport] = None,
+    checkpointer: Optional[Union[SqliteSessionStore, SessionStore]] = None,
+    transport: Optional[ColibriGatewayPort] = None,
 ) -> AgentRunResult:
     """Run the Colibri agent on `prompt` via the unified `ColibriAgent` runner."""
     cfg = config or AgentConfig()
@@ -1445,10 +1201,16 @@ __all__ = [
     "SYSTEM_PROMPT",
     "AgentRunResult",
     "ColibriAgent",
+    "ColibriGatewayPort",
     "ColibriSqliteCheckpointer",
     "ColibriTransport",
+    "HttpGatewayAdapter",
     "HttpTransport",
+    "InMemoryGatewayAdapter",
+    "InMemorySessionStore",
     "InternetAgentState",
+    "SessionStore",
+    "SqliteSessionStore",
     "StdlibColibriAgent",
     "build_internet_agent_graph",
     "classify_user_intent",

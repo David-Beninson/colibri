@@ -10,9 +10,12 @@ import json
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, Union
 
 from .config import AgentConfig
+
+if TYPE_CHECKING:
+    from .gateway import ColibriGatewayPort
 
 
 @dataclass
@@ -48,8 +51,13 @@ class ScoreDecision:
 class SystemOneClient:
     """Zero-dependency HTTP client for Colibri's ``POST /v1/systemone`` endpoint."""
 
-    def __init__(self, config: Optional[AgentConfig] = None) -> None:
+    def __init__(
+        self,
+        config: Optional[AgentConfig] = None,
+        gateway: Optional[ColibriGatewayPort] = None,
+    ) -> None:
         self.config = config or AgentConfig.from_env()
+        self.gateway = gateway
 
     @property
     def endpoint(self) -> str:
@@ -67,6 +75,22 @@ class SystemOneClient:
         timeout: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Send a batch of typed questions (`noul`, `choice`, `score`) over a shared `state`."""
+        if self.gateway is not None:
+            extra_body: Dict[str, Any] = {}
+            if prefix is not None:
+                extra_body["prefix"] = prefix
+            if pin_state is not None:
+                extra_body["pin_state"] = pin_state
+            slot = self.config.routing_cache_slot if cache_slot is None else cache_slot
+            return self.gateway.decide_systemone(
+                state=state,
+                questions=questions,
+                slot=slot,
+                normalize=normalize,
+                extra_body=extra_body,
+                model=self.config.model,
+            )
+
         body: Dict[str, Any] = {
             "model": self.config.model,
             "state": state,
