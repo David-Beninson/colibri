@@ -109,6 +109,7 @@ from .tools import (
     query_local_knowledge,
     query_memory,
     run_python_calculation,
+    SafeCalculationEngine,
     save_conversation_fact,
     save_fact,
     scale_recipe,
@@ -214,4 +215,5 @@ __all__ = [
     "ingest_url_or_note",
     "scale_recipe",
     "run_python_calculation",
+    "SafeCalculationEngine",
 ]

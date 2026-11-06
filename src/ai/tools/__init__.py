@@ -108,12 +108,18 @@ try:
         CODE_TOOL_REGISTRY,
         CODE_TOOLS,
         CODE_TOOLS_SCHEMA,
+        SafeCalculationEngine,
+        diff,
+        integrate,
         run_python_calculation,
     )
 except Exception:  # noqa: BLE001
     CODE_TOOLS = []
     CODE_TOOL_REGISTRY = {}
     CODE_TOOLS_SCHEMA = []
+    SafeCalculationEngine = None  # type: ignore[assignment]
+    diff = None  # type: ignore[assignment]
+    integrate = None  # type: ignore[assignment]
     run_python_calculation = None  # type: ignore[assignment]
 
 
@@ -625,4 +631,7 @@ __all__ = [
     "CANONICAL_COLLECTIONS",
     "_resolve_collection",
     "run_python_calculation",
+    "SafeCalculationEngine",
+    "diff",
+    "integrate",
 ]

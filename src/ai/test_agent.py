@@ -422,6 +422,149 @@ class ColibriAgentTestSuite(unittest.TestCase):
         )
         self.assertIn("error", str(py_blocked).lower())
 
+    def test_code_runner_ast_whitelist_rejections(self) -> None:
+        """Verify strict whitelist AST validator rejects forbidden statements and nodes."""
+        # 1. While loop is prohibited to prevent infinite loop DOS
+        res = json.loads(run_python_calculation("while True: pass"))
+        self.assertIn("error", res)
+        self.assertTrue(any(term in res["error"].lower() for term in ("while", "prohibited", "blocked")))
+
+        # 2. Class definition is prohibited
+        res_class = json.loads(run_python_calculation("class Exploit:\n    pass"))
+        self.assertIn("error", res_class)
+
+        # 3. Yield and generator functions are prohibited
+        res_yield = json.loads(run_python_calculation("def g():\n    yield 1\ng()"))
+        self.assertIn("error", res_yield)
+
+        res_yield_from = json.loads(run_python_calculation("def g():\n    yield from [1, 2]\ng()"))
+        self.assertIn("error", res_yield_from)
+
+        # 4. Lambda with dunder introspection (__class__, __subclasses__) is prohibited
+        res_dunder = json.loads(run_python_calculation("(lambda x: x.__class__.__subclasses__())()"))
+        self.assertIn("error", res_dunder)
+
+        # 5. Dangerous builtins (open, eval, exec, __import__) are prohibited
+        res_open = json.loads(run_python_calculation("open('/etc/passwd')"))
+        self.assertIn("error", res_open)
+
+        res_eval = json.loads(run_python_calculation("eval('2 + 2')"))
+        self.assertIn("error", res_eval)
+
+        res_exec = json.loads(run_python_calculation("exec('a = 1')"))
+        self.assertIn("error", res_exec)
+
+        # 6. Unwhitelisted imports are prohibited
+        res_sys = json.loads(run_python_calculation("import sys"))
+        self.assertIn("error", res_sys)
+
+        res_os = json.loads(run_python_calculation("from os import system"))
+        self.assertIn("error", res_os)
+
+        # 7. Private/internal identifiers cannot be assigned or accessed (defense-in-depth)
+        res_shadow = json.loads(run_python_calculation("_bounded_iter = lambda it, limit=1: it"))
+        self.assertIn("error", res_shadow)
+
+    def test_code_runner_numerical_calculus(self) -> None:
+        """Verify numerical calculus primitives diff() and integrate() work accurately."""
+        # Numerical derivative: f(x) = x^2 at x = 3 -> f'(3) = 6
+        res_diff = json.loads(run_python_calculation("diff(lambda x: x ** 2, 3)"))
+        self.assertAlmostEqual(res_diff["result"], 6.0, places=3)
+
+        # Numerical derivative: f(x) = sin(x) at x = 0 -> f'(0) = 1
+        res_diff_sin = json.loads(run_python_calculation("diff(sin, 0)"))
+        self.assertAlmostEqual(res_diff_sin["result"], 1.0, places=3)
+
+        # Numerical integral: f(x) = 2x from 0 to 3 -> [x^2]_0^3 = 9
+        res_int_poly = json.loads(run_python_calculation("integrate(lambda x: 2 * x, 0, 3)"))
+        self.assertAlmostEqual(res_int_poly["result"], 9.0, places=3)
+
+        # Numerical integral: f(x) = x^2 from 0 to 1 -> 1/3 = 0.333333
+        res_int_sq = json.loads(run_python_calculation("integrate(lambda x: x ** 2, 0, 1)"))
+        self.assertAlmostEqual(res_int_sq["result"], 1.0 / 3.0, places=3)
+
+        # Numerical integral: f(x) = sin(x) from 0 to pi -> 2.0
+        res_int_sin = json.loads(run_python_calculation("integrate(sin, 0, pi)"))
+        self.assertAlmostEqual(res_int_sin["result"], 2.0, places=3)
+
+    def test_code_runner_rich_math_and_statistics(self) -> None:
+        """Verify full math and statistics functions are built into safe environment."""
+        # Math functions
+        code_math = (
+            "c = comb(10, 3)\n"
+            "f = factorial(5)\n"
+            "g = gcd(48, 18)\n"
+            "l = lcm(12, 15)\n"
+            "e = erf(0)\n"
+            "result = {'comb': c, 'factorial': f, 'gcd': g, 'lcm': l, 'erf': e}"
+        )
+        res_math = json.loads(run_python_calculation(code_math))
+        self.assertEqual(res_math["result"]["comb"], 120)
+        self.assertEqual(res_math["result"]["factorial"], 120)
+        self.assertEqual(res_math["result"]["gcd"], 6)
+        self.assertEqual(res_math["result"]["lcm"], 60)
+        self.assertEqual(res_math["result"]["erf"], 0.0)
+
+        # Statistics functions
+        code_stat = (
+            "data = [10, 20, 30, 40, 50]\n"
+            "result = {'mean': mean(data), 'median': median([1, 9, 3]), 'stdev': round(stdev(data), 2)}"
+        )
+        res_stat = json.loads(run_python_calculation(code_stat))
+        self.assertEqual(res_stat["result"]["mean"], 30.0)
+        self.assertEqual(res_stat["result"]["median"], 3)
+        self.assertEqual(res_stat["result"]["stdev"], 15.81)
+
+    def test_code_runner_precision_and_datetime(self) -> None:
+        """Verify high-precision Decimal, Fraction, and safe date/time math."""
+        # Decimal exactness
+        res_dec = json.loads(
+            run_python_calculation("str(Decimal('0.1') + Decimal('0.2') == Decimal('0.3'))")
+        )
+        self.assertEqual(res_dec["result"], "True")
+
+        # Fraction exactness
+        res_frac = json.loads(
+            run_python_calculation("str(Fraction(1, 3) + Fraction(1, 6) == Fraction(1, 2))")
+        )
+        self.assertEqual(res_frac["result"], "True")
+
+        # Datetime math
+        code_dt = (
+            "d1 = date(2026, 12, 31)\n"
+            "d2 = date(2026, 11, 3)\n"
+            "delta_days = (d1 - d2).days\n"
+            "t = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc) + timedelta(days=2)\n"
+            "result = {'delta_days': delta_days, 'iso': t.isoformat()}"
+        )
+        res_dt = json.loads(run_python_calculation(code_dt))
+        self.assertEqual(res_dt["result"]["delta_days"], 58)
+        self.assertIn("2026-01-03T12:00:00", res_dt["result"]["iso"])
+
+    def test_code_runner_loop_iteration_guard(self) -> None:
+        """Verify loop/step iteration limits prevent infinite or excessive iterations."""
+        code_dos = "total = 0\nfor i in range(500000):\n    total += i\ntotal"
+        res = json.loads(run_python_calculation(code_dos))
+        self.assertIn("error", res)
+        self.assertTrue(any(term in res["error"].lower() for term in ("limit", "exceeded", "iteration")))
+
+    def test_safe_calculation_engine_class_seam(self) -> None:
+        """Verify SafeCalculationEngine public interface, custom iteration limits, and validation."""
+        from src.ai.tools.code_runner import SafeCalculationEngine
+
+        engine = SafeCalculationEngine(max_loop_iterations=10)
+        # Bounded iteration triggers quickly with small limit
+        res_limit = engine.execute("total = 0\nfor i in range(50):\n    total += i\ntotal")
+        self.assertIn("error", res_limit)
+        self.assertIn("limit", res_limit["error"].lower())
+
+        # Successful calculation and AST validation
+        tree = engine.validate_ast("a = 5\nb = 10\na * b")
+        self.assertIsNotNone(tree)
+        res_ok = engine.execute("a = 5\nb = 10\na * b")
+        self.assertEqual(res_ok["result"], 50)
+        self.assertEqual(res_ok["runner"], "ast-sandbox")
+
     def test_vision_and_voice_graceful_handling(self) -> None:
         # Bilingual voice selection
         self.assertEqual(_select_voice("שלום אהובה, יום הולדת שמח!", "auto"), "he-IL-HilaNeural")
