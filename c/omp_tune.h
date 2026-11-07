@@ -88,6 +88,13 @@ static void coli_omp_tune_threads(const char *engine)
     if (phys <= 0) return;                 /* sconosciuto -> default di OpenMP */
     int perf = coli_performance_cores();   /* a hybrid CPU: its P-cores pace the team */
     int team = perf > 0 && perf < phys ? perf : phys;
+#if defined(__APPLE__) && defined(__aarch64__)
+    /* Target M1 Air 16GB profile: cap compute threads strictly to at most 4 Firestorm P-cores
+     * to avoid barrier stalls on E-cores and prevent thermal throttling on fanless chassis. */
+    if (team > 4 && !getenv("COLI_MAX_CORES")) {
+        team = 4;
+    }
+#endif
     int logical = omp_get_max_threads();
     if (team >= logical) return;           /* niente SMT da evitare: silenzio */
 

@@ -223,7 +223,7 @@ def describe_image_scene(
         local_vision_url = f"{base}/chat/completions"
     if local_vision_url:
         try:
-            local_model = os.environ.get("COLIBRI_MODEL", "qwen36-35b")
+            local_model = os.environ.get("COLIBRI_MODEL", "qwen38-flash-next")
             local_key = os.environ.get("COLIBRI_API_KEY", "colibri")
             desc = _query_openai_compat_vision(
                 local_vision_url,

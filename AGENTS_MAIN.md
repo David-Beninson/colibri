@@ -33,13 +33,13 @@ src/ai/
 ## 2. Multi-Agent Collaboration & Context Handoffs
 
 1. **Decentralized Node Responsibilities**:
-   - **Router / Classifier (`systemone.py` / `agent` Node)**: Uses Colibri's `POST /v1/systemone` or structured tool-calling on `qwen36-35b` to decide whether a query requires live internet research, personal RAG memory lookup (`query_memory`), vision/OCR, voice synthesis, or fast companion direct response.
+   - **Router / Classifier (`systemone.py` / `agent` Node)**: Uses Colibri's `POST /v1/systemone` or structured tool-calling on `qwen38-flash-next` / `qwen36-35b` to decide whether a query requires live internet research, personal RAG memory lookup (`query_memory`), vision/OCR, voice synthesis, or fast companion direct response.
    - **Multimodal Executor (`tools/` / `tools` Node)**: Executes SSRF-safe internet queries, local OCR/vision, Whisper STT / Edge-TTS, local ChromaDB/JSON memory retrieval, and AST-sandboxed Python calculations in parallel (`ThreadPoolExecutor`), returning bounded payloads (`max_chars <= COLIBRI_MAX_TOOL_CHARS`).
    - **Verifier / Reflection Guard (`reflect_and_guard` Node in `graph.py`)**: Tracks tool step budget (`max_steps`, default `8`) and recovers from malformed `<tool_call>` syntax by nudging final cited synthesis.
 
 2. **Minimal Context Handoffs**:
    - Never dump raw HTML or unbounded JSON into the conversation state.
-   - Every tool output is stripped of boilerplate/navigation (`trafilatura` / stdlib HTML parser) and capped to `COLIBRI_MAX_TOOL_CHARS` (default `4000` chars).
+   - Every tool output is stripped of boilerplate/navigation (`trafilatura` / stdlib HTML parser) and capped to `COLIBRI_MAX_TOOL_CHARS` (default `8000` chars, elevated via `kv_fp8` unified memory savings).
    - Prefer `deep_web_research` for multi-source questions: it searches and extracts the top $N$ pages in a **single tool turn**, saving multiple prefill round-trips on `qwen36-35b`.
 
 ---

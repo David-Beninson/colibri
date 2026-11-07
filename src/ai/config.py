@@ -20,8 +20,9 @@ DEFAULT_BASE_URL = "http://127.0.0.1:8000/v1"
 OLLAMA_BASE_URL = "http://127.0.0.1:11434/v1"
 MLX_BASE_URL = "http://127.0.0.1:8080/v1"
 DEFAULT_API_KEY = "colibri"
-DEFAULT_MODEL = "qwen36-35b"
+DEFAULT_MODEL = "qwen38-flash-next"
 DEFAULT_CONTEXT_LENGTH = 65536
+DEFAULT_MAX_TOOL_CHARS = 8000
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -62,8 +63,16 @@ def _query_models_endpoint(
             payload = json.loads(resp.read().decode("utf-8", errors="replace"))
         data = payload.get("data")
         if isinstance(data, list) and data:
-            # Prefer Qwen3-30B-A3B / Qwen36 / Qwen2.5 models if multiple are listed (e.g. Ollama)
-            preferred = ("qwen36", "qwen3:30b-a3b", "qwen3", "qwen2.5:14b", "qwen2.5")
+            # Prefer Qwen3.8-Flash-Next / Qwen3.6 / Qwen3 models if multiple are listed
+            preferred = (
+                "qwen38-flash-next",
+                "qwen38",
+                "qwen36",
+                "qwen3:30b-a3b",
+                "qwen3",
+                "qwen2.5:14b",
+                "qwen2.5",
+            )
             chosen = data[0] if isinstance(data[0], dict) else {}
             for item in data:
                 if isinstance(item, dict):
@@ -174,7 +183,9 @@ class AgentConfig:
             or DEFAULT_API_KEY
         )
     )
-    model: str = field(default_factory=lambda: os.environ.get("COLIBRI_MODEL", ""))
+    model: str = field(
+        default_factory=lambda: os.environ.get("COLIBRI_MODEL", DEFAULT_MODEL)
+    )
     context_length: int = field(
         default_factory=lambda: _env_int("COLIBRI_CONTEXT_LENGTH", 0)
     )
@@ -195,7 +206,7 @@ class AgentConfig:
         default_factory=lambda: os.environ.get("COLIBRI_COMPACT", "auto")
     )
     max_tool_chars: int = field(
-        default_factory=lambda: _env_int("COLIBRI_MAX_TOOL_CHARS", 4000)
+        default_factory=lambda: _env_int("COLIBRI_MAX_TOOL_CHARS", DEFAULT_MAX_TOOL_CHARS)
     )
     max_iterations: int = field(
         default_factory=lambda: _env_int("COLIBRI_MAX_ITERATIONS", 3)
@@ -210,7 +221,7 @@ class AgentConfig:
         default_factory=lambda: float(os.environ.get("COLIBRI_TIMEOUT", "120.0"))
     )
     use_systemone_routing: bool = field(
-        default_factory=lambda: _env_bool("COLIBRI_USE_SYSTEMONE", False)
+        default_factory=lambda: _env_bool("COLIBRI_USE_SYSTEMONE", True)
     )
     auto_avatar_state: bool = field(
         default_factory=lambda: _env_bool("COLIBRI_AUTO_AVATAR", True)
